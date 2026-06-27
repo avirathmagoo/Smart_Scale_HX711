@@ -1,22 +1,12 @@
 """
 Smart Scale — Main Application
-Raspberry Pi 4B | 4× HX711 (shared CLK) | USB Webcam | 1024×600
+Raspberry Pi 4B | 4x HX711 (shared CLK) | USB Webcam | 1024x600
 
 ARCHITECTURE
-============
-Thread priority (highest → lowest):
-  1. hx711-acq   — raw GPIO bit-banging, pinned tight loop, no GIL contention
-  2. hx711-proc  — filtering, validation, calibration, publishes kg values
-  3. camera      — frame grab, always lowest priority
-  4. main        — pygame display + state machine, reads pre-computed values
-
-Key design decisions:
-  - Acquisition thread does NOTHING except GPIO reads → ring buffer
-  - Processing thread does all maths off the acquisition path
-  - Camera thread uses SCHED_IDLE via nice(19) to never compete with sensors
-  - Display loop reads atomically from a single shared struct, no waiting
-  - Tare and calibrate temporarily pause the acquisition loop cleanly
-  - All filtering happens in the processing thread, not the main loop
+  hx711-acq  thread  — GPIO reads into ring buffers (highest priority)
+  hx711-proc thread  — filtering + calibration, publishes kg values
+  camera     thread  — frame grab (lowest priority)
+  main       thread  — pygame display + state machine
 """
 
 import cv2
@@ -74,7 +64,6 @@ def load_config():
                 cfg = json.load(f)
             for k, v in DEFAULT_CONFIG.items():
                 cfg.setdefault(k, v)
-            # Migrate old grams key
             if "trigger_weight_g" in cfg and "trigger_weight_kg" not in cfg:
                 cfg["trigger_weight_kg"] = cfg.pop("trigger_weight_g") / 1000.0
             return cfg
@@ -88,7 +77,7 @@ def save_config(cfg):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HX711 LOW-LEVEL DRIVER
+# HX711 DRIVER  — proven simple approach that actually works
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
     import RPi.GPIO as GPIO
@@ -97,219 +86,171 @@ except ImportError:
     HW_AVAILABLE = False
     log.warning("RPi.GPIO not available — simulation mode")
 
-# HX711 raw value limits — 24-bit ADC, 2's complement
-# Values outside ±7,800,000 are almost certainly noise or corrupt reads
-HX711_RAW_MIN = -7_800_000
-HX711_RAW_MAX =  7_800_000
-# Maximum plausible raw delta between consecutive reads for a static load
-# (large, but rules out clearly corrupt bit-flips)
-HX711_MAX_DELTA = 500_000
+# 24-bit ADC hard limits
+HX711_MIN =  -8388608   # -2^23
+HX711_MAX =   8388607   #  2^23 - 1
+# Maximum believable jump between consecutive reads (static load)
+HX711_MAX_JUMP = 500000
 
-class HX711Raw:
+class HX711:
     """
-    Low-level HX711 driver for a single channel.
-
-    Design principles:
-    - _read() does ONE complete acquisition cycle: wait for DOUT low,
-      clock 24 data bits, clock gain pulses. Nothing else.
-    - No averaging here — that's the processing layer's job.
-    - Corrupt reads (timeout, impossible value) return None immediately.
-    - Power-down / power-up sequence for clean reset.
-    - CLK is shared — only this class touches it during a read, and the
-      acquisition manager serialises all reads so CLK is never contested.
+    Simple, reliable HX711 driver — matches the logic that worked before
+    but adds range validation and jump detection.
+    Gain = 128, Channel A (25 clock pulses total).
+    CLK is shared — only one HX711 is read at a time.
     """
-
-    def __init__(self, dout_pin: int, clk_pin: int):
-        self.dout = dout_pin
-        self.clk  = clk_pin
+    def __init__(self, dout: int, clk: int):
+        self.dout      = dout
+        self.clk       = clk
         self._last_raw = None
         if HW_AVAILABLE:
-            # CLK is set up once by the acquisition manager
+            # CLK already set up as OUTPUT by ScaleManager
             GPIO.setup(self.dout, GPIO.IN)
-            self._power_cycle()
-
-    def _power_cycle(self):
-        """
-        HX711 powers down when CLK is held HIGH > 60 µs.
-        Powers back up on CLK LOW. Resets internal state.
-        """
-        if not HW_AVAILABLE:
-            return
-        GPIO.output(self.clk, True)
-        time.sleep(0.0001)   # 100 µs > 60 µs threshold
-        GPIO.output(self.clk, False)
-        time.sleep(0.001)    # allow internal oscillator to stabilise
 
     def is_ready(self) -> bool:
-        """HX711 signals DOUT LOW when conversion is complete."""
         if not HW_AVAILABLE:
             return True
         return GPIO.input(self.dout) == 0
 
-    def read(self) -> int | None:
+    def read_raw(self) -> int | None:
         """
-        Perform one complete read cycle.
-
-        Returns raw 24-bit signed integer, or None if:
-        - DOUT never went LOW within timeout (sensor hung)
-        - Read value is outside plausible ADC range (corrupt)
-        - Read value jumps impossibly from last reading (bit-flip)
+        Read one sample. Returns signed 24-bit int or None on error.
+        DOUT goes LOW when HX711 conversion is complete — we poll for this.
+        No power-cycle reset: that was causing all 4 chips to lose sync.
         """
         if not HW_AVAILABLE:
-            import random
             base = self._last_raw if self._last_raw is not None else 0
-            val  = base + random.randint(-200, 200)
+            import random
+            val = base + random.randint(-300, 300)
             self._last_raw = val
             return val
 
-        # Wait for conversion ready (DOUT LOW), 200 ms timeout
-        deadline = time.monotonic() + 0.2
+        # Wait for DOUT LOW (conversion ready), 500 ms timeout
+        deadline = time.monotonic() + 0.5
         while GPIO.input(self.dout):
             if time.monotonic() > deadline:
-                log.warning(f"HX711 DOUT={self.dout} timeout — resetting")
-                self._power_cycle()
+                log.warning(f"HX711 DOUT={self.dout} not ready (timeout)")
                 return None
 
-        # Clock in 24 bits — each bit: CLK HIGH → sample DOUT → CLK LOW
-        # Timing: HX711 requires t_clk ≥ 0.2 µs HIGH, ≥ 0.2 µs LOW
-        # RPi GPIO toggling is ~1–2 µs naturally — no explicit sleep needed
+        # Clock in 24 bits
         raw = 0
         for _ in range(24):
             GPIO.output(self.clk, True)
             raw = (raw << 1) | GPIO.input(self.dout)
             GPIO.output(self.clk, False)
 
-        # 25th pulse sets gain=128 Channel A for NEXT conversion
+        # 25th pulse — sets gain=128 Channel A for next conversion
         GPIO.output(self.clk, True)
         GPIO.output(self.clk, False)
 
-        # Convert 24-bit two's complement to signed int
+        # Two's complement
         if raw & 0x800000:
             raw -= 0x1000000
 
-        # Validate range
-        if not (HX711_RAW_MIN <= raw <= HX711_RAW_MAX):
-            log.warning(f"DOUT={self.dout} out-of-range raw={raw} — discarded")
+        # Hard range check
+        if not (HX711_MIN <= raw <= HX711_MAX):
+            log.warning(f"DOUT={self.dout} raw={raw} out of range — discarded")
             return None
 
-        # Validate delta from last known good read
+        # Jump check — catches single-bit corruptions
         if self._last_raw is not None:
-            if abs(raw - self._last_raw) > HX711_MAX_DELTA:
-                log.warning(
-                    f"DOUT={self.dout} spike: {self._last_raw}→{raw} "
-                    f"(Δ={abs(raw - self._last_raw)}) — discarded"
-                )
+            jump = abs(raw - self._last_raw)
+            if jump > HX711_MAX_JUMP:
+                log.warning(f"DOUT={self.dout} spike Δ={jump} — discarded")
                 return None
 
         self._last_raw = raw
         return raw
 
+    def read_average(self, n: int = 5) -> float | None:
+        """
+        Read n samples, discard outliers, return trimmed mean.
+        Used for tare and calibration only.
+        """
+        samples = []
+        for _ in range(n):
+            v = self.read_raw()
+            if v is not None:
+                samples.append(v)
+            time.sleep(0.012)   # ~80 Hz HX711 sample rate
+
+        if len(samples) < max(3, n // 2):
+            log.warning(f"DOUT={self.dout} only got {len(samples)}/{n} samples")
+            return None
+
+        # Trimmed mean: drop top and bottom 15%
+        k = max(1, int(len(samples) * 0.15))
+        trimmed = sorted(samples)[k: len(samples) - k]
+        return sum(trimmed) / len(trimmed) if trimmed else sum(samples) / len(samples)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ACQUISITION PIPELINE
+# ACQUISITION + PROCESSING PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Ring buffer depth per channel — ~20 samples at ~10 Hz = ~2 s history
-RING_DEPTH = 32
+RING_DEPTH    = 24    # raw samples kept per channel
+FILTER_WINDOW = 16    # samples used per filtered output
+EMA_ALPHA     = 0.12  # display smoothing (lower = smoother)
+STABLE_THRESH = 0.008 # kg — reading must stay within this to be "stable"
+STABLE_COUNT  = 10    # consecutive stable readings needed
 
-class AcquisitionPipeline:
+
+class ScaleManager:
     """
-    Two-stage pipeline:
+    Two threads:
+      acq-thread  — reads all 4 cells sequentially, pushes to ring buffers
+      proc-thread — filters ring buffers, applies calibration, publishes kg
 
-    Stage 1 — hx711-acq thread (this class)
-      - Runs in a tight loop
-      - Reads all 4 channels sequentially (CLK is shared, must be sequential)
-      - Pushes raw validated integers into per-channel ring buffers
-      - Does NO arithmetic — pure I/O
-
-    Stage 2 — hx711-proc thread (ProcessingPipeline)
-      - Consumes raw ring buffers
-      - Applies offset, calibration, filtering, outlier rejection
-      - Publishes final kg values + diagnostics
-
-    The two stages communicate via ring buffers protected by a single lock.
-    The lock is held for microseconds (deque append/popleft only).
+    Main loop calls get_values() — returns instantly, never blocks.
+    Tare/calibrate pause the acq-thread and read directly.
     """
 
-    def __init__(self, clk_pin: int, dout_pins: list):
-        self.clk_pin   = clk_pin
-        self.dout_pins = dout_pins
-        self.n_cells   = len(dout_pins)
+    def __init__(self, cfg: dict):
+        self.cfg    = cfg
+        self._cells = []
+        self._n     = len(cfg["dout_pins"])
 
-        # Per-channel ring buffers of raw ints
-        self._buffers  = [collections.deque(maxlen=RING_DEPTH)
-                          for _ in range(self.n_cells)]
-        self._buf_lock = threading.Lock()
+        # Ring buffers — one deque per cell
+        self._ring     = [collections.deque(maxlen=RING_DEPTH) for _ in range(self._n)]
+        self._ring_lock = threading.Lock()
 
-        # Per-channel read counters and error counters for diagnostics
-        self._read_count = [0] * self.n_cells
-        self._err_count  = [0] * self.n_cells
+        # Published output (written by proc-thread, read by main + Flask)
+        self._out_lock = threading.Lock()
+        self._out = {
+            "kg":       [0.0] * self._n,
+            "ema_kg":   [0.0] * self._n,
+            "mean_kg":  0.0,
+            "ema_mean": 0.0,
+            "stable":   False,
+            "diag":     ["no_data"] * self._n,
+        }
 
-        # Control
-        self._stop   = threading.Event()
-        self._pause  = threading.Event()   # pause for tare/calibration
-        self._paused = threading.Event()   # signals caller that pause is active
+        # EMA state (proc-thread only)
+        self._ema_ch   = [0.0] * self._n
+        self._ema_mean = 0.0
+        self._prev_ema = 0.0
+        self._stable_ctr = 0
 
-        self.cells   = []
+        # Control events
+        self._stop  = threading.Event()
+        self._pause = threading.Event()   # set → acq-thread pauses
+        self._paused = threading.Event()  # set → acq-thread confirmed paused
 
         if HW_AVAILABLE:
             GPIO.setmode(GPIO.BCM)
             GPIO.setwarnings(False)
-            GPIO.setup(clk_pin, GPIO.OUT, initial=GPIO.LOW)
+            GPIO.setup(cfg["clk_pin"], GPIO.OUT, initial=GPIO.LOW)
 
-        for dout in dout_pins:
-            self.cells.append(HX711Raw(dout, clk_pin))
+        for dout in cfg["dout_pins"]:
+            self._cells.append(HX711(dout, cfg["clk_pin"]))
 
-        log.info(f"AcquisitionPipeline init — {self.n_cells} cells, "
-                 f"CLK=GPIO{clk_pin}, DOUT={dout_pins}, HW={'yes' if HW_AVAILABLE else 'SIM'}")
-
-    # ── Ring buffer access ─────────────────────────────────────────────────
-    def get_raw_snapshot(self) -> list:
-        """
-        Returns a list of N lists — current raw buffer contents per channel.
-        Copies under lock — caller gets a stable snapshot.
-        """
-        with self._buf_lock:
-            return [list(buf) for buf in self._buffers]
-
-    def get_diagnostics(self) -> dict:
-        return {
-            "reads":  list(self._read_count),
-            "errors": list(self._err_count),
-            "error_rates": [
-                round(self._err_count[i] / max(self._read_count[i], 1) * 100, 1)
-                for i in range(self.n_cells)
-            ]
-        }
-
-    # ── Pause / resume (for tare and calibration) ─────────────────────────
-    def pause_and_wait(self, timeout=3.0) -> bool:
-        """
-        Signal acquisition to pause, wait until it is actually paused.
-        Returns True if paused successfully.
-        During tare/calibration the caller reads directly from cells.
-        """
-        self._paused.clear()
-        self._pause.set()
-        return self._paused.wait(timeout)
-
-    def resume(self):
-        self._pause.clear()
+        log.info(f"ScaleManager init — {self._n} cells, "
+                 f"CLK=GPIO{cfg['clk_pin']}, DOUT={cfg['dout_pins']}, "
+                 f"HW={'yes' if HW_AVAILABLE else 'SIM'}")
 
     # ── Acquisition thread ─────────────────────────────────────────────────
     def _acq_loop(self):
-        """
-        Tight acquisition loop.
-        Reads cells sequentially — CLK is shared, only one cell at a time.
-        Each cell is read once per pass → push to ring buffer.
-
-        No sleep between reads: HX711 outputs ~10 Hz at 80 Hz crystal,
-        the is_ready() poll blocks until the conversion is done naturally.
-        This gives deterministic, conversion-rate-locked sampling.
-        """
         while not self._stop.is_set():
-
-            # ── Pause point ───────────────────────────────────────────
             if self._pause.is_set():
                 self._paused.set()
                 while self._pause.is_set() and not self._stop.is_set():
@@ -317,407 +258,225 @@ class AcquisitionPipeline:
                 self._paused.clear()
                 continue
 
-            # ── Read all cells ────────────────────────────────────────
-            for i, cell in enumerate(self.cells):
-                if self._stop.is_set():
+            for i, cell in enumerate(self._cells):
+                if self._stop.is_set() or self._pause.is_set():
                     break
-                raw = cell.read()
-                self._read_count[i] += 1
-                if raw is None:
-                    self._err_count[i] += 1
+                raw = cell.read_raw()
+                if raw is not None:
+                    with self._ring_lock:
+                        self._ring[i].append(raw)
+
+    # ── Processing thread ──────────────────────────────────────────────────
+    def _proc_loop(self):
+        while not self._stop.is_set():
+            time.sleep(0.08)   # process at ~12 Hz
+
+            with self._ring_lock:
+                snap = [list(buf) for buf in self._ring]
+
+            kg_vals = []
+            diags   = []
+
+            for i in range(self._n):
+                buf = snap[i]
+
+                if len(buf) < 4:
+                    kg_vals.append(self._ema_ch[i])
+                    diags.append("no_data")
                     continue
-                with self._buf_lock:
-                    self._buffers[i].append(raw)
 
+                # Use most recent FILTER_WINDOW samples
+                window = buf[-FILTER_WINDOW:]
+
+                # Saturation check
+                if abs(window[-1]) > 8_000_000:
+                    kg_vals.append(self._ema_ch[i])
+                    diags.append("saturated")
+                    continue
+
+                # Noise check
+                try:
+                    std = statistics.stdev(window)
+                except Exception:
+                    std = 0
+                if std > 80_000:
+                    kg_vals.append(self._ema_ch[i])
+                    diags.append("noisy")
+                    continue
+
+                # Trimmed mean
+                k       = max(1, int(len(window) * 0.15))
+                trimmed = sorted(window)[k: len(window) - k]
+                raw_avg = sum(trimmed) / len(trimmed) if trimmed else sum(window) / len(window)
+
+                # Calibration
+                offset = self.cfg["offsets"][i]
+                factor = self.cfg["cal_factors"][i]
+                factor = factor if abs(factor) >= 1 else 1.0
+                kg     = (raw_avg - offset) / factor
+
+                kg_vals.append(kg)
+                diags.append("ok")
+
+            mean_kg = sum(kg_vals) / len(kg_vals)
+
+            # EMA per channel
+            a = EMA_ALPHA
+            ema_ch = [a * kg_vals[i] + (1 - a) * self._ema_ch[i]
+                      for i in range(self._n)]
+            ema_mean = a * mean_kg + (1 - a) * self._ema_mean
+
+            # Stability
+            if abs(ema_mean - self._prev_ema) < STABLE_THRESH:
+                self._stable_ctr = min(self._stable_ctr + 1, STABLE_COUNT + 1)
+            else:
+                self._stable_ctr = 0
+            stable = self._stable_ctr >= STABLE_COUNT
+
+            self._ema_ch   = ema_ch
+            self._ema_mean = ema_mean
+            self._prev_ema = ema_mean
+
+            with self._out_lock:
+                self._out = {
+                    "kg":       kg_vals,
+                    "ema_kg":   ema_ch,
+                    "mean_kg":  mean_kg,
+                    "ema_mean": ema_mean,
+                    "stable":   stable,
+                    "diag":     diags,
+                }
+
+    # ── Public API ─────────────────────────────────────────────────────────
     def start(self):
-        t = threading.Thread(target=self._acq_loop, daemon=True, name="hx711-acq")
-        t.start()
-        # Attempt to raise acquisition thread priority (requires sudo or CAP_SYS_NICE)
-        try:
-            os.nice(-5)
-        except Exception:
-            pass
-        log.info("Acquisition thread started")
+        t1 = threading.Thread(target=self._acq_loop,  daemon=True, name="hx711-acq")
+        t2 = threading.Thread(target=self._proc_loop, daemon=True, name="hx711-proc")
+        t1.start()
+        t2.start()
+        log.info("HX711 acquisition + processing threads started")
 
-    def stop(self):
+    def get_values(self) -> dict:
+        with self._out_lock:
+            return dict(self._out)
+
+    def _pause_acq(self, timeout=3.0) -> bool:
+        self._paused.clear()
+        self._pause.set()
+        ok = self._paused.wait(timeout)
+        if not ok:
+            log.error("Acquisition thread did not pause in time")
+            self._pause.clear()
+        return ok
+
+    def _resume_acq(self):
+        self._pause.clear()
+
+    def tare(self) -> bool:
+        log.info("Tare: pausing acquisition…")
+        if not self._pause_acq():
+            return False
+
+        log.info("Tare: reading 20 samples per cell…")
+        new_offsets = []
+        ok = True
+
+        for i, cell in enumerate(self._cells):
+            avg = cell.read_average(20)
+            if avg is None:
+                log.error(f"Tare: cell {i} failed")
+                ok = False
+                new_offsets.append(self.cfg["offsets"][i])  # keep old
+            else:
+                log.info(f"  Cell {i}: offset={avg:.1f}")
+                new_offsets.append(avg)
+
+        self._resume_acq()
+
+        if ok:
+            self.cfg["offsets"] = new_offsets
+            save_config(self.cfg)
+            # Reset EMA to zero
+            with self._out_lock:
+                self._ema_ch   = [0.0] * self._n
+                self._ema_mean = 0.0
+                self._prev_ema = 0.0
+                self._stable_ctr = 0
+            log.info(f"Tare done — offsets: {[round(o) for o in new_offsets]}")
+
+        return ok
+
+    def calibrate(self, known_kg: float) -> bool:
+        if known_kg <= 0:
+            log.error(f"Calibrate: invalid known_kg={known_kg}")
+            return False
+
+        log.info(f"Calibrate: {known_kg:.4f} kg — pausing acquisition…")
+        if not self._pause_acq():
+            return False
+
+        log.info("Calibrate: reading 20 samples per cell…")
+        new_factors = []
+        valid       = []
+
+        for i, cell in enumerate(self._cells):
+            avg = cell.read_average(20)
+            if avg is None:
+                log.warning(f"  Cell {i}: no reads — skipping")
+                new_factors.append(None)
+                continue
+
+            net = avg - self.cfg["offsets"][i]
+            log.info(f"  Cell {i}: avg={avg:.1f} offset={self.cfg['offsets'][i]:.1f} net={net:.1f}")
+
+            if abs(net) < 500:
+                log.warning(f"  Cell {i}: net_raw too small ({net:.1f}) — skipping")
+                new_factors.append(None)
+                continue
+
+            factor = net / known_kg
+            if not (100 <= abs(factor) <= 5_000_000):
+                log.warning(f"  Cell {i}: factor={factor:.1f} out of range — skipping")
+                new_factors.append(None)
+                continue
+
+            log.info(f"  Cell {i}: factor={factor:.2f} ✓")
+            new_factors.append(factor)
+            valid.append(factor)
+
+        self._resume_acq()
+
+        if not valid:
+            log.error("Calibrate: no valid factors — check wiring and weight")
+            return False
+
+        mean_f = sum(valid) / len(valid)
+        final  = [f if f is not None else mean_f for f in new_factors]
+        self.cfg["cal_factors"] = final
+        save_config(self.cfg)
+        log.info(f"Calibrate done — factors: {[round(f) for f in final]}")
+        return True
+
+    def cleanup(self):
         self._stop.set()
         if HW_AVAILABLE:
             GPIO.cleanup()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PROCESSING PIPELINE  (filtering, calibration, validation)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-# Filter window — number of raw samples used per output value
-FILTER_WINDOW   = 16
-# EMA alpha — how quickly the displayed value tracks real changes
-# Lower = smoother but slower. 0.15 gives ~1.5 s settling time.
-EMA_ALPHA       = 0.15
-# Stability threshold — mean_kg must not change more than this between
-# consecutive processed readings to be considered "stable"
-STABLE_THRESH_KG = 0.010   # 10 g
-# How many consecutive stable readings before we say the reading is stable
-STABLE_COUNT_REQ = 8
-
-
-class CellDiagnostic:
-    OK          = "ok"
-    NO_DATA     = "no_data"      # ring buffer empty
-    NOISY       = "noisy"        # std dev too high
-    SATURATED   = "saturated"    # raw values near ADC limits
-
-
-class ProcessingPipeline:
-    """
-    Consumes AcquisitionPipeline ring buffers.
-    Runs in its own thread at lower priority than acquisition.
-
-    Per-channel processing per cycle:
-      1. Take snapshot of raw buffer
-      2. Reject if < MIN_SAMPLES
-      3. Trimmed mean (discard top & bottom 15%)
-      4. Apply offset and calibration factor → kg
-      5. EMA smoothing
-      6. Outlier / saturation / noise diagnostic
-
-    Mean kg = mean of all 4 channel kg values.
-    Stability detection on mean_kg.
-    """
-
-    MIN_SAMPLES = 6   # minimum raw samples needed to compute a valid reading
-
-    def __init__(self, acq: AcquisitionPipeline, cfg: dict):
-        self.acq      = acq
-        self.cfg      = cfg
-        self._lock    = threading.Lock()
-        self._stop    = threading.Event()
-
-        # Published values (read by main loop and Flask)
-        self._kg        = [0.0] * acq.n_cells
-        self._mean_kg   = 0.0
-        self._ema_kg    = [0.0] * acq.n_cells
-        self._ema_mean  = 0.0
-        self._diag      = [CellDiagnostic.NO_DATA] * acq.n_cells
-        self._stable    = False
-        self._stable_ctr = 0
-        self._prev_mean  = 0.0
-
-    # ── Internal processing ────────────────────────────────────────────────
-    @staticmethod
-    def _trimmed_mean(values: list, trim_frac=0.15) -> float:
-        """
-        Sort values, discard bottom and top trim_frac fraction,
-        return mean of remainder.
-        With FILTER_WINDOW=16 and trim_frac=0.15 → discard 2 low, 2 high.
-        """
-        n = len(values)
-        k = max(1, int(n * trim_frac))
-        trimmed = sorted(values)[k: n - k]
-        if not trimmed:
-            return statistics.mean(values)
-        return statistics.mean(trimmed)
-
-    def _process_channel(self, raw_buf: list, idx: int) -> tuple:
-        """
-        Returns (kg_value, diagnostic_string).
-        """
-        if len(raw_buf) < self.MIN_SAMPLES:
-            return self._ema_kg[idx], CellDiagnostic.NO_DATA
-
-        # Saturation check — raw near ±8M means load cell is overloaded
-        latest = raw_buf[-1]
-        if abs(latest) > 7_500_000:
-            return self._ema_kg[idx], CellDiagnostic.SATURATED
-
-        # Noise check — if std dev of raw buffer is extremely high,
-        # the sensor is unstable (wiring issue, vibration, etc.)
-        try:
-            std = statistics.stdev(raw_buf)
-        except statistics.StatisticsError:
-            std = 0.0
-
-        # Typical noise floor for HX711 ≈ 50–500 raw counts at rest.
-        # If std > 50,000 raw counts the cell is pathologically noisy.
-        if std > 50_000:
-            return self._ema_kg[idx], CellDiagnostic.NOISY
-
-        # Trimmed mean → remove per-sample spikes
-        raw_mean = self._trimmed_mean(raw_buf)
-
-        # Apply offset and calibration
-        offset = self.cfg["offsets"][idx]
-        factor = self.cfg["cal_factors"][idx]
-        if factor == 0 or abs(factor) < 1:
-            # Factor too small — calibration not done or corrupt
-            factor = 1.0
-        kg = (raw_mean - offset) / factor
-
-        return kg, CellDiagnostic.OK
-
-    def _proc_loop(self):
-        while not self._stop.is_set():
-            snapshot = self.acq.get_raw_snapshot()
-
-            kg_vals = []
-            diags   = []
-            for i in range(self.acq.n_cells):
-                kg, diag = self._process_channel(snapshot[i], i)
-                kg_vals.append(kg)
-                diags.append(diag)
-
-            mean_kg = sum(kg_vals) / len(kg_vals)
-
-            # EMA smoothing — per channel and on mean
-            ema_kg   = []
-            a        = EMA_ALPHA
-            for i in range(self.acq.n_cells):
-                ema = a * kg_vals[i] + (1 - a) * self._ema_kg[i]
-                ema_kg.append(ema)
-            ema_mean = a * mean_kg + (1 - a) * self._ema_mean
-
-            # Stability detection on EMA mean
-            delta = abs(ema_mean - self._prev_mean)
-            if delta < STABLE_THRESH_KG:
-                self._stable_ctr = min(self._stable_ctr + 1, STABLE_COUNT_REQ + 1)
-            else:
-                self._stable_ctr = 0
-            stable = (self._stable_ctr >= STABLE_COUNT_REQ)
-            self._prev_mean = ema_mean
-
-            # Publish atomically
-            with self._lock:
-                self._kg       = kg_vals
-                self._mean_kg  = mean_kg
-                self._ema_kg   = ema_kg
-                self._ema_mean = ema_mean
-                self._diag     = diags
-                self._stable   = stable
-
-            # Processing runs at ~10 Hz — no need to spin faster
-            time.sleep(0.1)
-
-    def start(self):
-        t = threading.Thread(target=self._proc_loop, daemon=True, name="hx711-proc")
-        t.start()
-        log.info("Processing thread started")
-
-    def stop(self):
-        self._stop.set()
-
-    def get_values(self) -> dict:
-        """
-        Returns dict with all published values.
-        Called by main loop and Flask — instant, no blocking.
-        """
-        with self._lock:
-            return {
-                "kg":        list(self._kg),
-                "mean_kg":   self._mean_kg,
-                "ema_kg":    list(self._ema_kg),
-                "ema_mean":  self._ema_mean,
-                "diag":      list(self._diag),
-                "stable":    self._stable,
-            }
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SCALE MANAGER  (tare, calibration, public interface)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class ScaleManager:
-    """
-    Public interface for the application.
-    Owns both AcquisitionPipeline and ProcessingPipeline.
-    Handles tare and calibration by pausing acquisition and reading directly.
-    """
-
-    # How many direct reads to take for tare / calibration
-    TARE_READS = 20
-    CAL_READS  = 20
-    # Minimum plausible calibration factor (raw counts per kg)
-    # For typical 5 kg load cells, expect ~400,000–800,000 raw/kg
-    MIN_CAL_FACTOR = 100
-    MAX_CAL_FACTOR = 5_000_000
-
-    def __init__(self, cfg: dict):
-        self.cfg  = cfg
-        self._acq = AcquisitionPipeline(cfg["clk_pin"], cfg["dout_pins"])
-        self._proc = ProcessingPipeline(self._acq, cfg)
-
-    def start(self):
-        self._acq.start()
-        self._proc.start()
-
-    def get_values(self) -> dict:
-        return self._proc.get_values()
-
-    # ── Direct read helper (used only during tare/calibrate) ──────────────
-    def _direct_read_all(self, n_reads: int) -> list | None:
-        """
-        Read each cell n_reads times directly (acquisition paused).
-        Returns list of n_reads raw values per cell, or None on failure.
-        """
-        per_cell = [[] for _ in range(len(self._acq.cells))]
-
-        for _ in range(n_reads):
-            for i, cell in enumerate(self._acq.cells):
-                raw = cell.read()
-                if raw is not None:
-                    per_cell[i].append(raw)
-            time.sleep(0.015)   # ~10 Hz HX711 output rate
-
-        # Require at least MIN_SAMPLES per cell
-        for i, buf in enumerate(per_cell):
-            if len(buf) < ProcessingPipeline.MIN_SAMPLES:
-                log.error(f"Cell {i} only returned {len(buf)} reads during direct read")
-                return None
-
-        return per_cell
-
-    # ── Tare ──────────────────────────────────────────────────────────────
-    def tare(self) -> bool:
-        """
-        Zero the scale.
-        Pauses acquisition, reads TARE_READS samples per cell,
-        stores trimmed mean as offset, resumes acquisition.
-        Returns True on success.
-        """
-        log.info("Tare: pausing acquisition…")
-        if not self._acq.pause_and_wait(timeout=3.0):
-            log.error("Tare: acquisition did not pause — aborting")
-            return False
-
-        log.info(f"Tare: reading {self.TARE_READS} samples per cell…")
-        per_cell = self._direct_read_all(self.TARE_READS)
-
-        self._acq.resume()
-
-        if per_cell is None:
-            log.error("Tare: insufficient readings — tare aborted")
-            return False
-
-        new_offsets = []
-        for i, buf in enumerate(per_cell):
-            offset = ProcessingPipeline._trimmed_mean(buf)
-            new_offsets.append(offset)
-            log.info(f"  Cell {i}: {len(buf)} reads, offset={offset:.1f}")
-
-        self.cfg["offsets"] = new_offsets
-        save_config(self.cfg)
-        self._proc.cfg = self.cfg
-
-        # Reset EMA to zero immediately
-        with self._proc._lock:
-            self._proc._ema_kg   = [0.0] * self._acq.n_cells
-            self._proc._ema_mean = 0.0
-            self._proc._prev_mean = 0.0
-
-        log.info(f"Tare complete — offsets: {[round(o) for o in new_offsets]}")
-        return True
-
-    # ── Calibration ───────────────────────────────────────────────────────
-    def calibrate(self, known_kg: float) -> bool:
-        """
-        Calibrate with a known reference weight (in kg).
-        Platform must already be tared. Place known weight, then call.
-        Computes cal_factor = net_raw / known_kg per cell.
-        Validates factors are within plausible range.
-        Returns True on success.
-        """
-        if known_kg <= 0:
-            log.error(f"Calibrate: invalid known_kg={known_kg}")
-            return False
-
-        log.info(f"Calibrate: {known_kg:.4f} kg reference — pausing acquisition…")
-        if not self._acq.pause_and_wait(timeout=3.0):
-            log.error("Calibrate: acquisition did not pause — aborting")
-            return False
-
-        log.info(f"Calibrate: reading {self.CAL_READS} samples per cell…")
-        per_cell = self._direct_read_all(self.CAL_READS)
-
-        self._acq.resume()
-
-        if per_cell is None:
-            log.error("Calibrate: insufficient readings — calibration aborted")
-            return False
-
-        new_factors = []
-        offsets     = self.cfg["offsets"]
-        valid_factors = []
-
-        for i, buf in enumerate(per_cell):
-            raw_mean = ProcessingPipeline._trimmed_mean(buf)
-            net_raw  = raw_mean - offsets[i]
-            log.info(f"  Cell {i}: raw_mean={raw_mean:.1f}, "
-                     f"offset={offsets[i]:.1f}, net_raw={net_raw:.1f}")
-
-            if abs(net_raw) < 100:
-                log.warning(f"  Cell {i}: net_raw too small ({net_raw:.1f}) "
-                             f"— cell may not be under load")
-                new_factors.append(None)
-                continue
-
-            factor = net_raw / known_kg
-            if not (self.MIN_CAL_FACTOR <= abs(factor) <= self.MAX_CAL_FACTOR):
-                log.warning(f"  Cell {i}: factor={factor:.1f} outside plausible range "
-                             f"[{self.MIN_CAL_FACTOR}, {self.MAX_CAL_FACTOR}] — flagged")
-                new_factors.append(None)
-                continue
-
-            log.info(f"  Cell {i}: factor={factor:.2f} raw/kg ✓")
-            new_factors.append(factor)
-            valid_factors.append(factor)
-
-        if not valid_factors:
-            log.error("Calibrate: no valid factors computed — check wiring and weight")
-            return False
-
-        mean_factor = sum(valid_factors) / len(valid_factors)
-
-        # Fill in failed cells with the mean of valid cells
-        final_factors = []
-        for i, f in enumerate(new_factors):
-            if f is not None:
-                final_factors.append(f)
-            else:
-                log.warning(f"  Cell {i}: using mean factor {mean_factor:.2f}")
-                final_factors.append(mean_factor)
-
-        self.cfg["cal_factors"] = final_factors
-        save_config(self.cfg)
-        self._proc.cfg = self.cfg
-
-        log.info(f"Calibration complete — factors: {[round(f) for f in final_factors]}")
-        return True
-
-    def get_diagnostics(self) -> dict:
-        return self._acq.get_diagnostics()
-
-    def cleanup(self):
-        self._proc.stop()
-        self._acq.stop()
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SHARED STATE  (Flask web server reads this)
+# SHARED STATE for Flask
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _shared = {
-    "weights":    [0.0, 0.0, 0.0, 0.0],
-    "mean":       0.0,
-    "status":     "idle",
-    "countdown":  0,
-    "last_photo": "",
-    "stable":     False,
-    "diag":       ["no_data"] * 4,
+    "weights": [0.0]*4, "mean": 0.0,
+    "status": "idle", "countdown": 0,
+    "last_photo": "", "stable": False,
+    "diag": ["no_data"]*4,
 }
 _shared_lock = threading.Lock()
 
-def update_shared(**kwargs):
+def update_shared(**kw):
     with _shared_lock:
-        _shared.update(kwargs)
+        _shared.update(kw)
 
 def get_shared() -> dict:
     with _shared_lock:
@@ -725,30 +484,23 @@ def get_shared() -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CAMERA  (background grab thread, lowest priority)
+# CAMERA
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Camera:
-    """
-    Grabs frames in a background thread.
-    Stream: 640×480 MJPG @ 30fps — for display.
-    Photo:  switches to 1280×720, grabs 1 frame, switches back.
-
-    Thread runs at nice(10) — explicitly lower priority than sensor threads.
-    """
-    def __init__(self, index, stream_w, stream_h, photo_w, photo_h):
-        self.index       = index
-        self.sw, self.sh = stream_w, stream_h
-        self.pw, self.ph = photo_w, photo_h
-        self._lock       = threading.Lock()
-        self._frame      = None
-        self._stop       = threading.Event()
-        self._cap        = None
+    def __init__(self, index, sw, sh, pw, ph):
+        self.index = index
+        self.sw, self.sh = sw, sh
+        self.pw, self.ph = pw, ph
+        self._lock  = threading.Lock()
+        self._frame = None
+        self._stop  = threading.Event()
+        self._cap   = None
         self._photo_req  = threading.Event()
         self._photo_done = threading.Event()
         self._photo_frame = None
 
-    def _open_cap(self, w, h) -> bool:
+    def _open(self, w, h) -> bool:
         if self._cap:
             self._cap.release()
         cap = cv2.VideoCapture(self.index, cv2.CAP_V4L2)
@@ -756,42 +508,35 @@ class Camera:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH,  w)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
         cap.set(cv2.CAP_PROP_FPS,          30)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)   # always freshest frame
+        cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
         self._cap = cap
         return cap.isOpened()
 
     def start(self) -> bool:
-        if not self._open_cap(self.sw, self.sh):
+        if not self._open(self.sw, self.sh):
             log.error("Camera: failed to open")
             return False
         t = threading.Thread(target=self._grab_loop, daemon=True, name="camera")
         t.start()
-        log.info(f"Camera: stream {self.sw}×{self.sh} MJPG started")
+        log.info(f"Camera: {self.sw}x{self.sh} MJPG started")
         return True
 
     def _grab_loop(self):
         try:
-            os.nice(10)   # lower priority than sensors
+            os.nice(10)
         except Exception:
             pass
-
         while not self._stop.is_set():
-            # Handle photo request
             if self._photo_req.is_set():
                 self._photo_req.clear()
-                log.info("Camera: switching to photo resolution")
-                self._open_cap(self.pw, self.ph)
-                # Flush stale buffer frames
+                self._open(self.pw, self.ph)
                 for _ in range(4):
                     self._cap.grab()
                 ret, frame = self._cap.read()
                 self._photo_frame = frame.copy() if ret else None
                 self._photo_done.set()
-                # Restore stream resolution
-                self._open_cap(self.sw, self.sh)
-                log.info("Camera: back to stream resolution")
+                self._open(self.sw, self.sh)
                 continue
-
             ret, frame = self._cap.read()
             if ret:
                 with self._lock:
@@ -816,7 +561,7 @@ class Camera:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PYGAME DISPLAY HELPERS
+# PYGAME HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 COL_WHITE  = (255, 255, 255)
@@ -827,7 +572,6 @@ COL_RED    = (220, 50,  50 )
 COL_ORANGE = (230, 130, 0  )
 COL_STRIP  = (22,  22,  22 )
 COL_LINE   = (65,  65,  65 )
-COL_STABLE = (0,   170, 0  )
 
 def make_fonts():
     return {
@@ -842,34 +586,20 @@ def frame_to_surface(frame, w, h):
         rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
     return pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
 
-def draw_strip(screen, fonts, vals: dict, labels, strip_y, dw, sh):
+def draw_strip(screen, fonts, vals, labels, strip_y, dw, sh):
     pygame.draw.rect(screen, COL_STRIP, (0, strip_y, dw, sh))
     pygame.draw.line(screen, COL_LINE,  (0, strip_y), (dw, strip_y), 1)
 
-    ema_kg  = vals["ema_kg"]
-    mean_kg = vals["ema_mean"]
-    diags   = vals["diag"]
-    stable  = vals["stable"]
+    ema  = vals["ema_kg"]
+    mean = vals["ema_mean"]
+    stbl = vals["stable"]
 
-    # Colour each cell by diagnostic
-    diag_colour = {
-        CellDiagnostic.OK:        COL_WHITE,
-        CellDiagnostic.NO_DATA:   COL_ORANGE,
-        CellDiagnostic.NOISY:     COL_RED,
-        CellDiagnostic.SATURATED: COL_RED,
-    }
+    parts = [f"{labels[i]}: {ema[i]:.3f}kg" for i in range(4)]
+    mean_txt = f"MEAN: {mean:.3f}kg" + (" ✓" if stbl else "")
+    text = "   |   ".join(parts) + "   |   " + mean_txt
 
-    parts = []
-    for i in range(4):
-        parts.append(f"{labels[i]}: {ema_kg[i]:.3f}kg")
-
-    mean_col  = COL_STABLE if stable else COL_WHITE
-    mean_text = f"MEAN: {mean_kg:.3f}kg"
-    if stable:
-        mean_text += " ✓"
-
-    full_text = "   |   ".join(parts) + "   |   " + mean_text
-    surf = fonts["small"].render(full_text, True, mean_col)
+    col  = (0, 210, 0) if stbl else COL_WHITE
+    surf = fonts["small"].render(text, True, col)
     tx   = max(8, (dw - surf.get_width()) // 2)
     ty   = strip_y + (sh - surf.get_height()) // 2
     screen.blit(surf, (tx, ty))
@@ -883,16 +613,16 @@ def draw_countdown(screen, fonts, secs, dw, dh):
     screen.blit(shadow, (cx+2, cy+2))
     screen.blit(surf,   (cx,   cy  ))
 
-def draw_msg(screen, fonts, text, color, x=10, y=10):
+def draw_msg(screen, fonts, text, color):
     surf = fonts["medium"].render(text, True, color)
-    screen.blit(surf, (x, y))
+    screen.blit(surf, (10, 10))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # PHOTO SAVE
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def save_photo(frame, vals: dict, labels, strip_h: int) -> str:
+def save_photo(frame, vals, labels, strip_h) -> str:
     photo   = frame.copy()
     h, w    = photo.shape[:2]
     strip_y = h - strip_h
@@ -900,20 +630,19 @@ def save_photo(frame, vals: dict, labels, strip_h: int) -> str:
     cv2.rectangle(photo, (0, strip_y), (w, h), (22, 22, 22), -1)
     cv2.line(photo, (0, strip_y), (w, strip_y), (65, 65, 65), 1)
 
-    ema_kg  = vals["ema_kg"]
-    mean_kg = vals["ema_mean"]
-
-    parts = [f"{labels[i]}: {ema_kg[i]:.3f}kg" for i in range(4)]
-    parts.append(f"MEAN: {mean_kg:.3f}kg")
-    text  = "   |   ".join(parts)
-
-    cv2.putText(photo, text, (10, strip_y + strip_h - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1, cv2.LINE_AA)
+    ema  = vals["ema_kg"]
+    mean = vals["ema_mean"]
+    parts = [f"{labels[i]}: {ema[i]:.3f}kg" for i in range(4)]
+    parts.append(f"MEAN: {mean:.3f}kg")
+    cv2.putText(photo, "   |   ".join(parts),
+                (10, strip_y + strip_h - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.58,
+                (255, 255, 255), 1, cv2.LINE_AA)
 
     ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = os.path.join(PHOTOS_DIR, f"capture_{ts}.jpg")
     cv2.imwrite(path, photo, [cv2.IMWRITE_JPEG_QUALITY, 95])
-    log.info(f"Photo saved: {path} ({w}×{h})")
+    log.info(f"Photo saved: {path} ({w}x{h})")
     return path
 
 
@@ -924,24 +653,18 @@ def save_photo(frame, vals: dict, labels, strip_h: int) -> str:
 def main():
     cfg = load_config()
 
-    # ── Scale ──────────────────────────────────────────────────────────────
+    # ── Scale: start acquisition first, then tare ──────────────────────────
     scale = ScaleManager(cfg)
-    log.info("Startup tare — platform must be EMPTY")
-    # Start acquisition first, wait for buffers to fill, then tare
     scale.start()
-    log.info("Waiting for HX711 buffers to fill (5s)…")
+    log.info("Startup tare — platform must be EMPTY. Waiting 5s for sensors…")
     time.sleep(5)
     scale.tare()
 
     # ── Camera ─────────────────────────────────────────────────────────────
-    cam = Camera(
-        cfg["camera_index"],
-        cfg["stream_width"],  cfg["stream_height"],
-        cfg["photo_width"],   cfg["photo_height"],
-    )
+    cam    = Camera(cfg["camera_index"],
+                    cfg["stream_width"], cfg["stream_height"],
+                    cfg["photo_width"],  cfg["photo_height"])
     cam_ok = cam.start()
-    if not cam_ok:
-        log.warning("Camera not available — continuing without camera")
 
     # ── Pygame ─────────────────────────────────────────────────────────────
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
@@ -976,18 +699,17 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_q:
                     cam.stop(); pygame.quit(); scale.cleanup()
-                    log.info("Stopped (q)"); return
+                    log.info("Stopped"); return
                 elif event.key == pygame.K_t:
                     threading.Thread(target=scale.tare, daemon=True).start()
 
-        # ── Hot-reload config ───────────────────────────────────────────
+        # ── Config hot-reload ───────────────────────────────────────────
         try:
             mt = os.path.getmtime(CONFIG_FILE)
             if mt != cfg_mtime:
                 cfg_mtime   = mt
                 cfg         = load_config()
                 scale.cfg   = cfg
-                scale._proc.cfg = cfg
                 trigger_kg  = cfg["trigger_weight_kg"]
                 stabilise_s = cfg["stabilise_seconds"]
                 labels      = cfg["cell_labels"]
@@ -997,7 +719,7 @@ def main():
         except Exception:
             pass
 
-        # ── Sensor values — instant, no blocking ───────────────────────
+        # ── Weights ─────────────────────────────────────────────────────
         vals    = scale.get_values()
         mean_kg = vals["ema_mean"]
         now     = time.time()
@@ -1008,10 +730,8 @@ def main():
                 state         = "countdown"
                 countdown_end = now + stabilise_s
                 log.info(f"Trigger: {mean_kg:.3f}kg")
-            update_shared(
-                weights=vals["ema_kg"], mean=mean_kg,
-                status="idle", stable=vals["stable"], diag=vals["diag"]
-            )
+            update_shared(weights=vals["ema_kg"], mean=mean_kg,
+                          status="idle", stable=vals["stable"], diag=vals["diag"])
 
         elif state == "countdown":
             remaining = countdown_end - now
@@ -1022,24 +742,18 @@ def main():
                 photo_frame = cam.capture_photo() if cam_ok else None
                 if photo_frame is not None:
                     last_photo = save_photo(photo_frame, vals, labels, strip_h)
-                else:
-                    log.warning("Photo capture returned no frame")
                 state        = "cooldown"
                 cooldown_end = now + 3.0
-            update_shared(
-                weights=vals["ema_kg"], mean=mean_kg,
-                status="countdown", countdown=max(0, remaining),
-                last_photo=last_photo, stable=vals["stable"], diag=vals["diag"]
-            )
+            update_shared(weights=vals["ema_kg"], mean=mean_kg,
+                          status="countdown", countdown=max(0, remaining),
+                          last_photo=last_photo, stable=vals["stable"], diag=vals["diag"])
 
         elif state == "cooldown":
             if now >= cooldown_end and mean_kg < trigger_kg:
                 state = "idle"
-            update_shared(
-                weights=vals["ema_kg"], mean=mean_kg,
-                status="cooldown", last_photo=last_photo,
-                stable=vals["stable"], diag=vals["diag"]
-            )
+            update_shared(weights=vals["ema_kg"], mean=mean_kg,
+                          status="cooldown", last_photo=last_photo,
+                          stable=vals["stable"], diag=vals["diag"])
 
         # ── Draw ────────────────────────────────────────────────────────
         frame = cam.get_frame() if cam_ok else None
@@ -1057,7 +771,7 @@ def main():
 
         draw_strip(screen, fonts, vals, labels, strip_y, DW, strip_h)
         pygame.display.flip()
-        clock.tick(20)   # 20 fps cap — sensor threads get priority
+        clock.tick(20)
 
     cam.stop()
     pygame.quit()
