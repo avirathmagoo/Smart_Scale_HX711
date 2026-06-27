@@ -172,35 +172,84 @@ def save_display():
 
 
 # ── Calibration ────────────────────────────────────────────────────────────────
+def _direct_reads(cfg, n=20):
+    import time as _t
+    from scale_app import HX711Raw, ProcessingPipeline
+    import RPi.GPIO as GPIO
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    GPIO.setup(cfg["clk_pin"], GPIO.OUT, initial=GPIO.LOW)
+    cells    = [HX711Raw(dout, cfg["clk_pin"]) for dout in cfg["dout_pins"]]
+    per_cell = [[] for _ in range(len(cells))]
+    for _ in range(n):
+        for i, cell in enumerate(cells):
+            raw = cell.read()
+            if raw is not None:
+                per_cell[i].append(raw)
+        _t.sleep(0.015)
+    GPIO.cleanup()
+    return per_cell
+
+
 @app.route("/tare", methods=["POST"])
 @login_required
 def do_tare():
     try:
-        from scale_app import ScaleManager
-        cfg   = load_config()
-        scale = ScaleManager(cfg)
-        ok    = scale.tare()
-        if ok:
-            flash("Tare complete — platform zeroed.", "ok")
-        else:
-            flash("Tare failed — check sensor connections.", "err")
+        from scale_app import ProcessingPipeline
+        cfg      = load_config()
+        per_cell = _direct_reads(cfg, n=20)
+        offsets  = []
+        for i, buf in enumerate(per_cell):
+            if len(buf) < 5:
+                flash(f"Tare failed: cell {i} returned only {len(buf)} reads — check wiring.", "err")
+                return redirect(url_for("index") + "#calibration")
+            offsets.append(ProcessingPipeline._trimmed_mean(buf))
+        cfg["offsets"]     = offsets
+        cfg["cal_factors"] = [1.0, 1.0, 1.0, 1.0]
+        save_config(cfg)
+        log.info(f"Web tare done — offsets: {[round(o) for o in offsets]}")
+        flash("Tare complete — platform zeroed.", "ok")
     except Exception as e:
         flash(f"Tare error: {e}", "err")
     return redirect(url_for("index") + "#calibration")
+
 
 @app.route("/calibrate", methods=["POST"])
 @login_required
 def do_calibrate():
     try:
-        from scale_app import ScaleManager
-        cfg       = load_config()
-        known_kg  = float(request.form["known_weight_kg"])
-        scale     = ScaleManager(cfg)
-        ok        = scale.calibrate(known_kg)
-        if ok:
-            flash(f"Calibration done with {known_kg:.4f} kg reference.", "ok")
-        else:
-            flash("Calibration failed — check sensor connections and weight placement.", "err")
+        from scale_app import ProcessingPipeline
+        cfg      = load_config()
+        known_kg = float(request.form["known_weight_kg"])
+        if known_kg <= 0:
+            flash("Known weight must be greater than zero.", "err")
+            return redirect(url_for("index") + "#calibration")
+        per_cell = _direct_reads(cfg, n=20)
+        offsets  = cfg["offsets"]
+        factors  = []
+        valid    = []
+        for i, buf in enumerate(per_cell):
+            if len(buf) < 5:
+                factors.append(None)
+                continue
+            net = ProcessingPipeline._trimmed_mean(buf) - offsets[i]
+            if abs(net) < 100:
+                factors.append(None)
+                continue
+            f = net / known_kg
+            if not (100 <= abs(f) <= 5_000_000):
+                factors.append(None)
+                continue
+            factors.append(f)
+            valid.append(f)
+        if not valid:
+            flash("Calibration failed — no valid factors. Check wiring and weight placement.", "err")
+            return redirect(url_for("index") + "#calibration")
+        mean_f = sum(valid) / len(valid)
+        cfg["cal_factors"] = [f if f is not None else mean_f for f in factors]
+        save_config(cfg)
+        log.info(f"Web calibration done — factors: {[round(f) for f in cfg['cal_factors']]}")
+        flash(f"Calibration done with {known_kg:.4f} kg reference.", "ok")
     except Exception as e:
         flash(f"Calibration error: {e}", "err")
     return redirect(url_for("index") + "#calibration")

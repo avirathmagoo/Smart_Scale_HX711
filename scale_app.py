@@ -927,9 +927,11 @@ def main():
     # ── Scale ──────────────────────────────────────────────────────────────
     scale = ScaleManager(cfg)
     log.info("Startup tare — platform must be EMPTY")
-    time.sleep(2)
-    scale.tare()
+    # Start acquisition first, wait for buffers to fill, then tare
     scale.start()
+    log.info("Waiting for HX711 buffers to fill (5s)…")
+    time.sleep(5)
+    scale.tare()
 
     # ── Camera ─────────────────────────────────────────────────────────────
     cam = Camera(
