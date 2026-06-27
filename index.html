@@ -152,8 +152,8 @@
       <p class="section-label">Trigger &amp; Timing</p>
       <div class="form-row">
         <div class="field w160">
-          <label>Trigger Weight (g)</label>
-          <input type="number" step="1" name="trigger_weight_g" value="{{ cfg.trigger_weight_g }}">
+          <label>Trigger Weight (kg)</label>
+          <input type="number" step="0.001" name="trigger_weight_kg" value="{{ cfg.trigger_weight_kg }}">
           <span class="hint">Capture fires above this (after tare)</span>
         </div>
         <div class="field w160">
@@ -210,8 +210,8 @@
     <form method="POST" action="/calibrate">
       <div class="form-row">
         <div class="field w200">
-          <label>Known Reference Weight (g)</label>
-          <input type="number" step="0.1" min="1" name="known_weight_g" placeholder="e.g. 500">
+          <label>Known Reference Weight (kg)</label>
+          <input type="number" step="0.1" min="1" name="known_weight_kg" placeholder="e.g. 1.0">
         </div>
       </div>
       <div class="btn-row">
