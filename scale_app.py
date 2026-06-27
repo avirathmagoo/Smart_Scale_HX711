@@ -320,7 +320,7 @@ def main():
     scale.tare()
 
     # Open camera (OpenCV headless is fine for capture)
-    cap = cv2.VideoCapture(cfg["camera_index"])
+    cap = cv2.VideoCapture(cfg["camera_index"], cv2.CAP_V4L2)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  cfg["cam_width"])
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg["cam_height"])
     if not cap.isOpened():
