@@ -247,8 +247,8 @@ def cv2_frame_to_pygame(frame, target_w, target_h):
     """Convert OpenCV BGR frame → pygame surface, resized to target."""
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     frame_rgb = cv2.resize(frame_rgb, (target_w, target_h))
-    # pygame wants (width, height, channels) with C-contiguous array
-    surface = pygame.surfarray.make_surface(np.transpose(frame_rgb, (1, 0, 2)))
+    # Use pygame.image.frombuffer — avoids surfarray axis issues on Pi
+    surface = pygame.image.frombuffer(frame_rgb.tobytes(), (target_w, target_h), "RGB")
     return surface
 
 def draw_weight_strip(screen, fonts, weights, mean, cfg, unit_label, strip_y, w):
