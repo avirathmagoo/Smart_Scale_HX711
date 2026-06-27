@@ -501,6 +501,7 @@ def main():
         weights_kg, mean_kg = scale.get_weights()
 
         now = time.time()
+        remaining = 0.0
 
         # ── State machine ───────────────────────────────────────────────
         if state == "idle":
@@ -540,7 +541,13 @@ def main():
             draw_msg(screen, fonts, "Waiting for camera…", COL_RED)
 
         if state == "countdown":
-            draw_countdown(screen, fonts, remaining, DW, DH)
+            draw_countdown(
+    screen,
+    fonts,
+    max(0.0, countdown_end - time.time()),
+    DW,
+    DH,
+)
         elif state == "cooldown":
             draw_msg(screen, fonts, "Photo saved!", COL_GREEN)
 
