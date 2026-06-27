@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Scale — Login</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1a1a1a; color: #ddd; font-family: monospace; display: flex;
+         justify-content: center; align-items: center; height: 100vh; }
+  .box { background: #252525; border: 1px solid #444; padding: 2rem; width: 320px; }
+  h2 { margin-bottom: 1.5rem; color: #fff; font-size: 1.1rem; letter-spacing: 1px; }
+  label { display: block; margin-bottom: .3rem; font-size: .85rem; color: #aaa; }
+  input { width: 100%; padding: .5rem; background: #1a1a1a; border: 1px solid #555;
+          color: #ddd; font-size: .95rem; margin-bottom: 1rem; }
+  button { width: 100%; padding: .6rem; background: #2a7a2a; color: #fff;
+           border: none; cursor: pointer; font-size: .95rem; letter-spacing: 1px; }
+  button:hover { background: #3a9a3a; }
+  .error { color: #e06060; margin-bottom: 1rem; font-size: .85rem; }
+</style>
+</head>
+<body>
+<div class="box">
+  <h2>SMART SCALE — CONFIG</h2>
+  {% if error %}<div class="error">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <label>Username</label>
+    <input type="text" name="username" autofocus>
+    <label>Password</label>
+    <input type="password" name="password">
+    <button type="submit">LOGIN</button>
+  </form>
+</div>
+</body>
+</html>

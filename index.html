@@ -1,0 +1,448 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Smart Scale Config</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #1a1a1a; color: #ccc; font-family: monospace; font-size: .9rem; }
+
+  /* ── Layout ── */
+  .topbar { background: #111; border-bottom: 1px solid #333; padding: .6rem 1.2rem;
+            display: flex; justify-content: space-between; align-items: center; }
+  .topbar h1 { color: #fff; font-size: 1rem; letter-spacing: 1px; }
+  .topbar a { color: #aaa; text-decoration: none; font-size: .8rem; }
+  .topbar a:hover { color: #fff; }
+
+  .live-bar { background: #0d1f0d; border-bottom: 1px solid #2a4a2a;
+              padding: .5rem 1.2rem; display: flex; gap: 1.5rem; align-items: center;
+              flex-wrap: wrap; }
+  .live-bar span { font-size: .85rem; }
+  .live-bar .label { color: #888; }
+  .live-bar .val { color: #5f5; font-weight: bold; }
+  .live-bar .status { color: #ff5; }
+
+  nav { background: #1e1e1e; border-bottom: 1px solid #333;
+        padding: .5rem 1.2rem; display: flex; gap: .8rem; flex-wrap: wrap; }
+  nav a { color: #aaa; text-decoration: none; padding: .3rem .7rem;
+          border: 1px solid #444; font-size: .8rem; }
+  nav a:hover { color: #fff; border-color: #777; }
+
+  .content { max-width: 900px; margin: 0 auto; padding: 1.2rem; }
+
+  /* ── Cards ── */
+  .card { background: #252525; border: 1px solid #383838;
+          margin-bottom: 1.5rem; }
+  .card-header { background: #2e2e2e; padding: .6rem 1rem;
+                 border-bottom: 1px solid #383838;
+                 display: flex; justify-content: space-between; align-items: center; }
+  .card-header h2 { color: #fff; font-size: .9rem; letter-spacing: .5px; }
+  .card-body { padding: 1rem; }
+
+  /* ── Forms ── */
+  .form-row { display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: .8rem; }
+  .field { display: flex; flex-direction: column; gap: .3rem; }
+  .field label { color: #999; font-size: .8rem; }
+  .field input, .field select {
+    background: #1a1a1a; border: 1px solid #555; color: #ddd;
+    padding: .4rem .6rem; font-family: monospace; font-size: .9rem; width: 100%; }
+  .field input:focus, .field select:focus { outline: none; border-color: #888; }
+  .field.w80  { width: 80px; }
+  .field.w120 { width: 120px; }
+  .field.w160 { width: 160px; }
+  .field.w200 { width: 200px; }
+  .field.w240 { width: 240px; }
+  .field.grow { flex: 1; min-width: 120px; }
+
+  .hint { color: #666; font-size: .78rem; margin-top: .2rem; }
+
+  /* ── Buttons ── */
+  .btn { padding: .45rem 1rem; border: none; cursor: pointer;
+         font-family: monospace; font-size: .85rem; letter-spacing: .5px; }
+  .btn-green  { background: #2a6a2a; color: #fff; }
+  .btn-green:hover  { background: #3a8a3a; }
+  .btn-blue   { background: #1a4a7a; color: #fff; }
+  .btn-blue:hover   { background: #2a6aaa; }
+  .btn-orange { background: #7a4a1a; color: #fff; }
+  .btn-orange:hover { background: #aa6a2a; }
+  .btn-red    { background: #7a1a1a; color: #fff; }
+  .btn-red:hover    { background: #aa2a2a; }
+  .btn-gray   { background: #3a3a3a; color: #ccc; }
+  .btn-gray:hover   { background: #4a4a4a; }
+
+  .btn-row { display: flex; gap: .6rem; flex-wrap: wrap; margin-top: .8rem; }
+
+  /* ── Alerts ── */
+  .alert { padding: .5rem 1rem; margin-bottom: 1rem; font-size: .85rem; }
+  .alert.ok  { background: #0d2a0d; border-left: 3px solid #4a8a4a; color: #8f8; }
+  .alert.err { background: #2a0d0d; border-left: 3px solid #8a4a4a; color: #f88; }
+
+  /* ── Photo grid ── */
+  .photo-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px,1fr));
+                gap: .8rem; }
+  .photo-item { background: #1a1a1a; border: 1px solid #383838; }
+  .photo-item img { width: 100%; display: block; max-height: 130px; object-fit: cover; }
+  .photo-meta { padding: .4rem .5rem; font-size: .75rem; color: #888; }
+  .photo-meta .pname { color: #bbb; display: block; margin-bottom: .15rem;
+                       white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .photo-meta a { color: #5af; text-decoration: none; font-size: .75rem; }
+  .photo-meta a:hover { text-decoration: underline; }
+
+  /* ── Cal table ── */
+  table.cal { border-collapse: collapse; width: 100%; }
+  table.cal th { background: #2e2e2e; color: #aaa; padding: .4rem .6rem;
+                 text-align: left; font-weight: normal; font-size: .8rem; }
+  table.cal td { padding: .35rem .4rem; border-bottom: 1px solid #303030; }
+  table.cal input { background: #1a1a1a; border: 1px solid #555; color: #ddd;
+                    padding: .3rem .4rem; font-family: monospace; font-size: .85rem;
+                    width: 120px; }
+
+  /* ── Divider ── */
+  hr.section { border: none; border-top: 1px solid #333; margin: 1rem 0; }
+  .section-label { color: #777; font-size: .78rem; text-transform: uppercase;
+                   letter-spacing: 1px; margin-bottom: .6rem; }
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <h1>⚖ SMART SCALE — CONFIG &amp; DATA</h1>
+  <a href="/logout">Logout</a>
+</div>
+
+<!-- Live weight bar -->
+<div class="live-bar" id="live-bar">
+  <span class="label">LIVE —</span>
+  {% for i in range(4) %}
+  <span><span class="label">{{ cfg.cell_labels[i] }}:</span>
+        <span class="val" id="w{{ i }}">{{ "%.1f"|format(live.weights[i]) }}{{ cfg.unit }}</span></span>
+  {% endfor %}
+  <span><span class="label">MEAN:</span>
+        <span class="val" id="wmean">{{ "%.1f"|format(live.mean) }}{{ cfg.unit }}</span></span>
+  <span><span class="label">Status:</span>
+        <span class="status" id="wstatus">{{ live.status }}</span></span>
+</div>
+
+<!-- Section nav -->
+<nav>
+  <a href="#scale">Scale</a>
+  <a href="#calibration">Calibration</a>
+  <a href="#gpio">GPIO</a>
+  <a href="#display">Display</a>
+  <a href="#wifi">WiFi</a>
+  <a href="#photos">Photos</a>
+  <a href="#system">System</a>
+</nav>
+
+<div class="content">
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for cat, msg in messages %}
+  <div class="alert {{ cat }}">{{ msg }}</div>
+  {% endfor %}
+{% endwith %}
+
+
+<!-- ══ SCALE SETTINGS ══════════════════════════════════════════════════════ -->
+<div class="card" id="scale">
+  <div class="card-header"><h2>SCALE SETTINGS</h2></div>
+  <div class="card-body">
+    <form method="POST" action="/save_scale">
+      <p class="section-label">Trigger &amp; Timing</p>
+      <div class="form-row">
+        <div class="field w160">
+          <label>Trigger Weight (g)</label>
+          <input type="number" step="1" name="trigger_weight_g" value="{{ cfg.trigger_weight_g }}">
+          <span class="hint">Capture fires above this (after tare)</span>
+        </div>
+        <div class="field w160">
+          <label>Stabilise Delay (s)</label>
+          <input type="number" step="0.5" min="1" max="30" name="stabilise_seconds" value="{{ cfg.stabilise_seconds }}">
+          <span class="hint">Countdown before photo is taken</span>
+        </div>
+        <div class="field w120">
+          <label>Display Unit</label>
+          <select name="unit">
+            <option value="g"  {% if cfg.unit=='g'  %}selected{% endif %}>Grams (g)</option>
+            <option value="kg" {% if cfg.unit=='kg' %}selected{% endif %}>Kilograms (kg)</option>
+          </select>
+        </div>
+      </div>
+
+      <hr class="section">
+      <p class="section-label">Cell Labels (shown on screen &amp; in photos)</p>
+      <div class="form-row">
+        {% for i in range(4) %}
+        <div class="field w120">
+          <label>Cell {{ i+1 }} Label</label>
+          <input type="text" name="label{{ i }}" maxlength="6" value="{{ cfg.cell_labels[i] }}">
+        </div>
+        {% endfor %}
+      </div>
+
+      <div class="btn-row">
+        <button class="btn btn-green" type="submit">Save Scale Settings</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+
+<!-- ══ CALIBRATION ═════════════════════════════════════════════════════════ -->
+<div class="card" id="calibration">
+  <div class="card-header"><h2>CALIBRATION</h2></div>
+  <div class="card-body">
+
+    <p class="section-label">Step 1 — Tare (Zero the scale)</p>
+    <p style="color:#888;font-size:.82rem;margin-bottom:.7rem;">
+      Remove everything from the platform, then press Tare.
+    </p>
+    <form method="POST" action="/tare">
+      <button class="btn btn-orange" type="submit">Run Tare Now</button>
+    </form>
+
+    <hr class="section">
+    <p class="section-label">Step 2 — Calibrate with known weight</p>
+    <p style="color:#888;font-size:.82rem;margin-bottom:.7rem;">
+      After taring, place your reference weight on the platform and enter its value below.
+    </p>
+    <form method="POST" action="/calibrate">
+      <div class="form-row">
+        <div class="field w200">
+          <label>Known Reference Weight (g)</label>
+          <input type="number" step="0.1" min="1" name="known_weight_g" placeholder="e.g. 500">
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-blue" type="submit">Run Calibration</button>
+      </div>
+    </form>
+
+    <hr class="section">
+    <p class="section-label">Manual Calibration Values (Advanced)</p>
+    <p style="color:#888;font-size:.82rem;margin-bottom:.7rem;">
+      Edit raw offsets and factors directly. Only change if you know what you're doing.
+    </p>
+    <form method="POST" action="/save_cal_manual">
+      <table class="cal">
+        <tr>
+          <th>Cell</th><th>Label</th><th>Offset (raw)</th><th>Cal Factor</th>
+        </tr>
+        {% for i in range(4) %}
+        <tr>
+          <td>{{ i+1 }}</td>
+          <td>{{ cfg.cell_labels[i] }}</td>
+          <td><input type="number" step="1"    name="offset{{ i }}" value="{{ cfg.offsets[i] }}"></td>
+          <td><input type="number" step="0.001" name="factor{{ i }}" value="{{ cfg.cal_factors[i] }}"></td>
+        </tr>
+        {% endfor %}
+      </table>
+      <div class="btn-row">
+        <button class="btn btn-gray" type="submit">Save Manual Values</button>
+      </div>
+    </form>
+
+    <hr class="section">
+    <p class="section-label">Current Calibration State</p>
+    <table class="cal">
+      <tr><th>Cell</th><th>Offset</th><th>Factor</th></tr>
+      {% for i in range(4) %}
+      <tr>
+        <td>{{ cfg.cell_labels[i] }}</td>
+        <td>{{ cfg.offsets[i] }}</td>
+        <td>{{ cfg.cal_factors[i] }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </div>
+</div>
+
+
+<!-- ══ GPIO SETTINGS ═══════════════════════════════════════════════════════ -->
+<div class="card" id="gpio">
+  <div class="card-header"><h2>GPIO / HX711 PINS  <small style="color:#666;font-weight:normal">(BCM numbering)</small></h2></div>
+  <div class="card-body">
+    <p style="color:#f88;font-size:.82rem;margin-bottom:.8rem;">
+      ⚠ Changes take effect after restarting the scale app.
+    </p>
+    <form method="POST" action="/save_gpio">
+      <div class="form-row">
+        <div class="field w120">
+          <label>CLK Pin (shared)</label>
+          <input type="number" name="clk_pin" value="{{ cfg.clk_pin }}">
+        </div>
+      </div>
+      <div class="form-row">
+        {% for i in range(4) %}
+        <div class="field w120">
+          <label>DOUT — Cell {{ i+1 }} ({{ cfg.cell_labels[i] }})</label>
+          <input type="number" name="dout{{ i }}" value="{{ cfg.dout_pins[i] }}">
+        </div>
+        {% endfor %}
+      </div>
+      <p class="hint">Default wiring: CLK=GPIO6, DOUT=GPIO5/13/19/26 (all on physical pins 29–37)</p>
+      <div class="btn-row">
+        <button class="btn btn-green" type="submit">Save GPIO Settings</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+
+<!-- ══ DISPLAY SETTINGS ════════════════════════════════════════════════════ -->
+<div class="card" id="display">
+  <div class="card-header"><h2>DISPLAY SETTINGS</h2></div>
+  <div class="card-body">
+    <p style="color:#888;font-size:.82rem;margin-bottom:.8rem;">Changes take effect after restarting the scale app.</p>
+    <form method="POST" action="/save_display">
+      <div class="form-row">
+        <div class="field w120">
+          <label>Screen Width (px)</label>
+          <input type="number" name="display_width" value="{{ cfg.display_width }}">
+        </div>
+        <div class="field w120">
+          <label>Screen Height (px)</label>
+          <input type="number" name="display_height" value="{{ cfg.display_height }}">
+        </div>
+        <div class="field w160">
+          <label>Weight Strip Height (px)</label>
+          <input type="number" name="weight_strip_height" value="{{ cfg.weight_strip_height }}">
+          <span class="hint">Bottom strip on screen &amp; photos</span>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-green" type="submit">Save Display Settings</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+
+<!-- ══ WIFI ════════════════════════════════════════════════════════════════ -->
+<div class="card" id="wifi">
+  <div class="card-header"><h2>ADD FALLBACK WiFi NETWORK</h2></div>
+  <div class="card-body">
+    <p style="color:#888;font-size:.82rem;margin-bottom:.8rem;">
+      The Pi will connect to this network only if the current network is unavailable.
+      Your primary network (set during OS setup) is not affected.
+    </p>
+    <form method="POST" action="/add_wifi">
+      <div class="form-row">
+        <div class="field w240">
+          <label>WiFi Network Name (SSID)</label>
+          <input type="text" name="ssid" autocomplete="off">
+        </div>
+        <div class="field w240">
+          <label>Password</label>
+          <input type="password" name="wifi_pass" autocomplete="off">
+        </div>
+      </div>
+      <p class="hint">Saved to /etc/wpa_supplicant/wpa_supplicant.conf with lower priority than existing networks.</p>
+      <div class="btn-row">
+        <button class="btn btn-blue" type="submit">Save Network</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+
+<!-- ══ PHOTOS ══════════════════════════════════════════════════════════════ -->
+<div class="card" id="photos">
+  <div class="card-header">
+    <h2>CAPTURED PHOTOS ({{ photos|length }})</h2>
+    <div style="display:flex;gap:.5rem;">
+      <a href="/download_all" class="btn btn-blue">⬇ Download All (ZIP)</a>
+      <form method="POST" action="/delete_all" onsubmit="return confirm('Delete ALL photos?')">
+        <button class="btn btn-red" type="submit">✕ Delete All</button>
+      </form>
+    </div>
+  </div>
+  <div class="card-body">
+    {% if not photos %}
+    <p style="color:#666;font-size:.85rem;">No photos captured yet.</p>
+    {% else %}
+    <div class="photo-grid">
+      {% for p in photos %}
+      <div class="photo-item">
+        <a href="/photos/{{ p.name }}" target="_blank">
+          <img src="/photos/{{ p.name }}" alt="{{ p.name }}" loading="lazy">
+        </a>
+        <div class="photo-meta">
+          <span class="pname" title="{{ p.name }}">{{ p.name }}</span>
+          {{ p.time }}<br>
+          {{ p.size_kb }} KB &nbsp;
+          <a href="/download/{{ p.name }}">⬇ download</a>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+  </div>
+</div>
+
+
+<!-- ══ SYSTEM ══════════════════════════════════════════════════════════════ -->
+<div class="card" id="system">
+  <div class="card-header"><h2>SYSTEM</h2></div>
+  <div class="card-body">
+    <p class="section-label">Scale Application</p>
+    <div class="btn-row">
+      <form method="POST" action="/restart_scale">
+        <button class="btn btn-blue" type="submit">Restart Scale App</button>
+      </form>
+    </div>
+    <p class="hint" style="margin-top:.4rem;">
+      Required after changing GPIO or display settings.
+    </p>
+
+    <hr class="section">
+    <p class="section-label">Raspberry Pi</p>
+    <div class="btn-row">
+      <form method="POST" action="/reboot"
+            onsubmit="return confirm('Reboot the Pi?')">
+        <button class="btn btn-orange" type="submit">Reboot Pi</button>
+      </form>
+      <form method="POST" action="/shutdown"
+            onsubmit="return confirm('Shut down the Pi? You will need to power-cycle to restart.')">
+        <button class="btn btn-red" type="submit">Shutdown Pi</button>
+      </form>
+    </div>
+
+    <hr class="section">
+    <p class="section-label">Config File</p>
+    <p style="color:#666;font-size:.8rem;">{{ "/home/pi/smartscale/config.json" }}</p>
+    <p style="color:#666;font-size:.8rem;">Photos: {{ "/home/pi/smartscale/photos/" }}</p>
+    <p style="color:#666;font-size:.8rem;">Log: {{ "/home/pi/smartscale/scale.log" }}</p>
+    <p style="color:#666;font-size:.8rem;">Web IP: 192.168.1.100:5000</p>
+  </div>
+</div>
+
+</div><!-- /content -->
+
+<!-- Live weight polling -->
+<script>
+  function poll() {
+    fetch("/api/live")
+      .then(r => r.json())
+      .then(d => {
+        for (let i = 0; i < 4; i++) {
+          const el = document.getElementById("w" + i);
+          if (el) el.textContent = d.weights[i].toFixed(1);
+        }
+        const m = document.getElementById("wmean");
+        if (m) m.textContent = d.mean.toFixed(1);
+        const s = document.getElementById("wstatus");
+        if (s) {
+          s.textContent = d.status;
+          s.style.color = d.status === "countdown" ? "#ff5" :
+                          d.status === "cooldown"   ? "#5f5" : "#aaa";
+        }
+      })
+      .catch(() => {});
+  }
+  setInterval(poll, 1000);
+</script>
+
+</body>
+</html>

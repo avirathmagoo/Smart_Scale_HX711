@@ -1,0 +1,18 @@
+[Unit]
+Description=Smart Weight Scale Application
+After=network.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/smartscale
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/pi/.Xauthority
+ExecStart=/usr/bin/python3 /home/pi/smartscale/launcher.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/pi/smartscale/scale.log
+StandardError=append:/home/pi/smartscale/scale.log
+
+[Install]
+WantedBy=graphical.target
