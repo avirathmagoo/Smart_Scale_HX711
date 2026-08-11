@@ -1,12 +1,18 @@
 """
-Smart Scale — Main Application
-Raspberry Pi 4B | 4x HX711 (shared CLK) | USB Webcam | 1024x600
+Smart Scale — Main Application  (UART / ESP32 edition)
+Raspberry Pi 4B | ESP32 (4x HX711 bridge, over UART) | USB Webcam | 1024x600
 
 ARCHITECTURE
-  hx711-acq  thread  — GPIO reads into ring buffers (highest priority)
-  hx711-proc thread  — filtering + calibration, publishes kg values
-  camera     thread  — frame grab (lowest priority)
-  main       thread  — pygame display + state machine
+  uart-reader thread — reads ESP32 packets, validates checksum, fills ring buffers
+  hx711-proc  thread — filtering + calibration (Pi-side), publishes kg values
+  camera      thread — frame grab (lowest priority)
+  button      thread — GPIO17 hardware capture button (interrupt-driven)
+  main        thread — pygame display + state machine + touch controls
+
+All load-cell hardware access (HX711 chips) now lives on the ESP32. The Pi
+only ever talks to the ESP32 over UART — see ESP32_Code.cpp for the packet
+format. Calibration/tare math is unchanged from the original GPIO version;
+only the data SOURCE changed.
 """
 
 import cv2
@@ -14,11 +20,15 @@ import pygame
 import time
 import json
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import logging
+import zipfile
 import collections
 import statistics
-import numpy as np
 from datetime import datetime
 from pathlib import Path
 
@@ -42,20 +52,32 @@ DEFAULT_CONFIG = {
     "display_width":        1024,
     "display_height":       600,
     "weight_strip_height":  50,
+    "control_bar_height":   50,
     "trigger_weight_kg":    0.5,
     "stabilise_seconds":    5.0,
     "unit":                 "kg",
     "cell_labels":          ["C1", "C2", "C3", "C4"],
-    "clk_pin":              6,
-    "dout_pins":            [5, 13, 19, 26],
+    # UART link to the ESP32 (replaces clk_pin/dout_pins)
+    "uart_port":             "/dev/serial0",
+    "uart_baud":             115200,
+    # Hardware capture button
+    "button_gpio":           17,
+    # Calibration (unchanged meaning: raw counts in, kg out)
     "offsets":              [0, 0, 0, 0],
     "cal_factors":          [1.0, 1.0, 1.0, 1.0],
+    # Camera
     "camera_index":         0,
     "stream_width":         640,
     "stream_height":        480,
     "photo_width":          1280,
     "photo_height":         720,
+    # Behaviour
+    "autocapture_enabled":  True,
+    # Storage cap — 32GB SD card; default leaves headroom for OS + packages
+    "photos_max_mb":        20000,
 }
+
+_cfg_lock = threading.Lock()
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -64,237 +86,252 @@ def load_config():
                 cfg = json.load(f)
             for k, v in DEFAULT_CONFIG.items():
                 cfg.setdefault(k, v)
-            if "trigger_weight_g" in cfg and "trigger_weight_kg" not in cfg:
-                cfg["trigger_weight_kg"] = cfg.pop("trigger_weight_g") / 1000.0
             return cfg
         except Exception as e:
             log.error(f"Config load error: {e} — using defaults")
     return dict(DEFAULT_CONFIG)
 
 def save_config(cfg):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(cfg, f, indent=2)
+    with _cfg_lock:
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# HX711 DRIVER  — proven simple approach that actually works
+# UART READER — talks to the ESP32
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
-    import RPi.GPIO as GPIO
-    HW_AVAILABLE = True
+    import serial
+    SERIAL_AVAILABLE = True
 except ImportError:
-    HW_AVAILABLE = False
-    log.warning("RPi.GPIO not available — simulation mode")
+    SERIAL_AVAILABLE = False
+    log.warning("pyserial not available — simulation mode")
 
-# 24-bit ADC hard limits
-HX711_MIN =  -8388608   # -2^23
-HX711_MAX =   8388607   #  2^23 - 1
-# Maximum believable jump between consecutive reads (static load)
-HX711_MAX_JUMP = 500000
+RING_DEPTH   = 24     # raw samples kept per channel
+LINK_TIMEOUT = 2.0    # seconds without a valid packet before "disconnected"
 
-class HX711:
+_DATA_RE = re.compile(r"^D,(-?\d+),(-?\d+),(-?\d+),(-?\d+),([0-9A-Fa-f]{2})$")
+
+
+class UARTReader:
     """
-    Simple, reliable HX711 driver — matches the logic that worked before
-    but adds range validation and jump detection.
-    Gain = 128, Channel A (25 clock pulses total).
-    CLK is shared — only one HX711 is read at a time.
+    Owns the serial connection to the ESP32.
+    Background thread continuously reads lines, validates the checksum,
+    and appends good raw samples to per-channel ring buffers.
+    Also handles the tare handshake ('T' -> 'A,TARE_OK'/'A,TARE_FAIL').
     """
-    def __init__(self, dout: int, clk: int):
-        self.dout      = dout
-        self.clk       = clk
-        self._last_raw = None
-        if HW_AVAILABLE:
-            # CLK already set up as OUTPUT by ScaleManager
-            GPIO.setup(self.dout, GPIO.IN)
 
-    def is_ready(self) -> bool:
-        if not HW_AVAILABLE:
-            return True
-        return GPIO.input(self.dout) == 0
+    def __init__(self, port: str, baud: int):
+        self.port = port
+        self.baud = baud
+        self._ring = [collections.deque(maxlen=RING_DEPTH) for _ in range(4)]
+        self._ring_lock = threading.Lock()
+        self._last_packet_time = 0.0
+        self._valid_count = 0
+        self._invalid_count = 0
+        self._stop = threading.Event()
+        self._ser = None
+        self._tare_result = threading.Event()
+        self._tare_ok = False
 
-    def read_raw(self) -> int | None:
-        """
-        Read one sample. Returns signed 24-bit int or None on error.
-        DOUT goes LOW when HX711 conversion is complete — we poll for this.
-        No power-cycle reset: that was causing all 4 chips to lose sync.
-        """
-        if not HW_AVAILABLE:
-            base = self._last_raw if self._last_raw is not None else 0
-            import random
-            val = base + random.randint(-300, 300)
-            self._last_raw = val
-            return val
+        if SERIAL_AVAILABLE:
+            try:
+                self._ser = serial.Serial(port, baud, timeout=1.0)
+                log.info(f"UART opened: {port} @ {baud}")
+            except Exception as e:
+                log.error(f"UART open failed ({port}): {e} — simulation mode")
+                self._ser = None
+        else:
+            self._ser = None
 
-        # Wait for DOUT LOW (conversion ready), 500 ms timeout
-        deadline = time.monotonic() + 0.5
-        while GPIO.input(self.dout):
-            if time.monotonic() > deadline:
-                log.warning(f"HX711 DOUT={self.dout} not ready (timeout)")
-                return None
+    def start(self):
+        t = threading.Thread(target=self._read_loop, daemon=True, name="uart-reader")
+        t.start()
 
-        # Clock in 24 bits
-        raw = 0
-        for _ in range(24):
-            GPIO.output(self.clk, True)
-            raw = (raw << 1) | GPIO.input(self.dout)
-            GPIO.output(self.clk, False)
+    def _read_loop(self):
+        sim_base = [0, 0, 0, 0]
+        while not self._stop.is_set():
+            if self._ser is None:
+                # Simulation mode — lets the UI run for development/testing
+                # without hardware attached.
+                import random
+                for i in range(4):
+                    sim_base[i] += random.randint(-200, 200)
+                    with self._ring_lock:
+                        self._ring[i].append(sim_base[i])
+                self._last_packet_time = time.time()
+                time.sleep(0.05)
+                continue
 
-        # 25th pulse — sets gain=128 Channel A for next conversion
-        GPIO.output(self.clk, True)
-        GPIO.output(self.clk, False)
+            try:
+                line = self._ser.readline().decode("ascii", errors="ignore").strip()
+            except Exception as e:
+                log.warning(f"UART read error: {e}")
+                time.sleep(0.2)
+                continue
 
-        # Two's complement
-        if raw & 0x800000:
-            raw -= 0x1000000
+            if not line:
+                continue
 
-        # Hard range check
-        if not (HX711_MIN <= raw <= HX711_MAX):
-            log.warning(f"DOUT={self.dout} raw={raw} out of range — discarded")
-            return None
+            if line.startswith("D,"):
+                self._handle_data_line(line)
+            elif line.startswith("A,"):
+                self._handle_ack_line(line)
+            # Anything else (boot banner noise, partial lines) is ignored.
 
-        # Jump check — catches single-bit corruptions
-        if self._last_raw is not None:
-            jump = abs(raw - self._last_raw)
-            if jump > HX711_MAX_JUMP:
-                log.warning(f"DOUT={self.dout} spike Δ={jump} — discarded")
-                return None
+    def _handle_data_line(self, line: str):
+        m = _DATA_RE.match(line)
+        if not m:
+            self._invalid_count += 1
+            return
 
-        self._last_raw = raw
-        return raw
+        r1, r2, r3, r4, chk_hex = m.groups()
+        body = f"{r1},{r2},{r3},{r4}"
+        checksum = 0
+        for ch in body:
+            checksum ^= ord(ch)
+        if checksum != int(chk_hex, 16):
+            self._invalid_count += 1
+            log.debug(f"UART checksum mismatch: {line}")
+            return
 
-    def read_average(self, n: int = 5) -> float | None:
-        """
-        Read n samples, discard outliers, return trimmed mean.
-        Used for tare and calibration only.
-        """
-        samples = []
-        for _ in range(n):
-            v = self.read_raw()
-            if v is not None:
-                samples.append(v)
-            time.sleep(0.012)   # ~80 Hz HX711 sample rate
+        self._valid_count += 1
+        self._last_packet_time = time.time()
+        vals = [int(r1), int(r2), int(r3), int(r4)]
+        with self._ring_lock:
+            for i in range(4):
+                self._ring[i].append(vals[i])
 
-        if len(samples) < max(3, n // 2):
-            log.warning(f"DOUT={self.dout} only got {len(samples)}/{n} samples")
-            return None
+    def _handle_ack_line(self, line: str):
+        if line == "A,TARE_OK":
+            self._tare_ok = True
+            self._tare_result.set()
+        elif line == "A,TARE_FAIL":
+            self._tare_ok = False
+            self._tare_result.set()
+        elif line == "A,READY":
+            log.info("ESP32 reported READY")
 
-        # Trimmed mean: drop top and bottom 15%
-        k = max(1, int(len(samples) * 0.15))
-        trimmed = sorted(samples)[k: len(samples) - k]
-        return sum(trimmed) / len(trimmed) if trimmed else sum(samples) / len(samples)
+    # ── Public API ─────────────────────────────────────────────────────────
+    def get_snapshot(self):
+        with self._ring_lock:
+            return [list(buf) for buf in self._ring]
+
+    @property
+    def connected(self) -> bool:
+        return (time.time() - self._last_packet_time) < LINK_TIMEOUT
+
+    def send_tare(self, timeout: float = 5.0) -> bool:
+        """Send 'T' to the ESP32 and wait for the ack. Returns True on TARE_OK,
+        False on TARE_FAIL or timeout (no hardware / not connected)."""
+        if self._ser is None:
+            log.warning("Tare: no UART connection — skipping ESP32-side tare")
+            return False
+        self._tare_result.clear()
+        try:
+            self._ser.write(b"T\n")
+        except Exception as e:
+            log.error(f"Tare: UART write failed: {e}")
+            return False
+        got = self._tare_result.wait(timeout)
+        if not got:
+            log.warning("Tare: no ack from ESP32 within timeout")
+            return False
+        return self._tare_ok
+
+    def stats(self):
+        return {
+            "connected": self.connected,
+            "valid_packets": self._valid_count,
+            "invalid_packets": self._invalid_count,
+        }
+
+    def cleanup(self):
+        self._stop.set()
+        if self._ser:
+            try:
+                self._ser.close()
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ACQUISITION + PROCESSING PIPELINE
+# CALIBRATION / FILTER PIPELINE  (unchanged math from the original GPIO version)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-RING_DEPTH    = 24    # raw samples kept per channel
 FILTER_WINDOW = 16    # samples used per filtered output
 EMA_ALPHA     = 0.12  # display smoothing (lower = smoother)
 STABLE_THRESH = 0.008 # kg — reading must stay within this to be "stable"
 STABLE_COUNT  = 10    # consecutive stable readings needed
 
 
+def _trimmed_mean(samples):
+    if not samples:
+        return 0.0
+    k = max(1, int(len(samples) * 0.15))
+    trimmed = sorted(samples)[k: len(samples) - k]
+    return sum(trimmed) / len(trimmed) if trimmed else sum(samples) / len(samples)
+
+
 class ScaleManager:
     """
-    Two threads:
-      acq-thread  — reads all 4 cells sequentially, pushes to ring buffers
-      proc-thread — filters ring buffers, applies calibration, publishes kg
-
-    Main loop calls get_values() — returns instantly, never blocks.
-    Tare/calibrate pause the acq-thread and read directly.
+    Owns a UARTReader and a processing thread that filters + calibrates
+    the raw stream into kg values. tare()/calibrate() read directly from
+    the current ring-buffer snapshot — no pausing needed, since the
+    UARTReader thread is an independent producer.
     """
 
     def __init__(self, cfg: dict):
-        self.cfg    = cfg
-        self._cells = []
-        self._n     = len(cfg["dout_pins"])
+        self.cfg   = cfg
+        self.uart  = UARTReader(cfg["uart_port"], cfg["uart_baud"])
+        self._n    = 4
 
-        # Ring buffers — one deque per cell
-        self._ring     = [collections.deque(maxlen=RING_DEPTH) for _ in range(self._n)]
-        self._ring_lock = threading.Lock()
-
-        # Published output (written by proc-thread, read by main + Flask)
         self._out_lock = threading.Lock()
         self._out = {
-            "kg":       [0.0] * self._n,
-            "ema_kg":   [0.0] * self._n,
+            "kg":       [0.0] * 4,
+            "ema_kg":   [0.0] * 4,
             "mean_kg":  0.0,
             "ema_mean": 0.0,
             "stable":   False,
-            "diag":     ["no_data"] * self._n,
+            "diag":     ["no_data"] * 4,
+            "uart_ok":  False,
         }
 
-        # EMA state (proc-thread only)
-        self._ema_ch   = [0.0] * self._n
-        self._ema_mean = 0.0
-        self._prev_ema = 0.0
-        self._stable_ctr = 0
+        self._ema_ch      = [0.0] * 4
+        self._ema_mean     = 0.0
+        self._prev_ema      = 0.0
+        self._stable_ctr    = 0
 
-        # Control events
-        self._stop  = threading.Event()
-        self._pause = threading.Event()   # set → acq-thread pauses
-        self._paused = threading.Event()  # set → acq-thread confirmed paused
+        self._stop = threading.Event()
 
-        if HW_AVAILABLE:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setwarnings(False)
-            GPIO.setup(cfg["clk_pin"], GPIO.OUT, initial=GPIO.LOW)
+        log.info(f"ScaleManager init — UART={cfg['uart_port']}@{cfg['uart_baud']}")
 
-        for dout in cfg["dout_pins"]:
-            self._cells.append(HX711(dout, cfg["clk_pin"]))
+    def start(self):
+        self.uart.start()
+        t = threading.Thread(target=self._proc_loop, daemon=True, name="hx711-proc")
+        t.start()
+        log.info("Processing thread started")
 
-        log.info(f"ScaleManager init — {self._n} cells, "
-                 f"CLK=GPIO{cfg['clk_pin']}, DOUT={cfg['dout_pins']}, "
-                 f"HW={'yes' if HW_AVAILABLE else 'SIM'}")
-
-    # ── Acquisition thread ─────────────────────────────────────────────────
-    def _acq_loop(self):
-        while not self._stop.is_set():
-            if self._pause.is_set():
-                self._paused.set()
-                while self._pause.is_set() and not self._stop.is_set():
-                    time.sleep(0.01)
-                self._paused.clear()
-                continue
-
-            for i, cell in enumerate(self._cells):
-                if self._stop.is_set() or self._pause.is_set():
-                    break
-                raw = cell.read_raw()
-                if raw is not None:
-                    with self._ring_lock:
-                        self._ring[i].append(raw)
-
-    # ── Processing thread ──────────────────────────────────────────────────
     def _proc_loop(self):
         while not self._stop.is_set():
-            time.sleep(0.08)   # process at ~12 Hz
+            time.sleep(0.08)  # ~12 Hz
 
-            with self._ring_lock:
-                snap = [list(buf) for buf in self._ring]
+            snap = self.uart.get_snapshot()
+            link_ok = self.uart.connected
 
             kg_vals = []
             diags   = []
 
-            for i in range(self._n):
+            for i in range(4):
                 buf = snap[i]
 
-                if len(buf) < 4:
+                if not link_ok or len(buf) < 4:
                     kg_vals.append(self._ema_ch[i])
                     diags.append("no_data")
                     continue
 
-                # Use most recent FILTER_WINDOW samples
                 window = buf[-FILTER_WINDOW:]
 
-                # Saturation check
-                if abs(window[-1]) > 8_000_000:
-                    kg_vals.append(self._ema_ch[i])
-                    diags.append("saturated")
-                    continue
-
-                # Noise check
                 try:
                     std = statistics.stdev(window)
                 except Exception:
@@ -304,12 +341,8 @@ class ScaleManager:
                     diags.append("noisy")
                     continue
 
-                # Trimmed mean
-                k       = max(1, int(len(window) * 0.15))
-                trimmed = sorted(window)[k: len(window) - k]
-                raw_avg = sum(trimmed) / len(trimmed) if trimmed else sum(window) / len(window)
+                raw_avg = _trimmed_mean(window)
 
-                # Calibration
                 offset = self.cfg["offsets"][i]
                 factor = self.cfg["cal_factors"][i]
                 factor = factor if abs(factor) >= 1 else 1.0
@@ -320,13 +353,10 @@ class ScaleManager:
 
             mean_kg = sum(kg_vals) / len(kg_vals)
 
-            # EMA per channel
             a = EMA_ALPHA
-            ema_ch = [a * kg_vals[i] + (1 - a) * self._ema_ch[i]
-                      for i in range(self._n)]
+            ema_ch = [a * kg_vals[i] + (1 - a) * self._ema_ch[i] for i in range(4)]
             ema_mean = a * mean_kg + (1 - a) * self._ema_mean
 
-            # Stability
             if abs(ema_mean - self._prev_ema) < STABLE_THRESH:
                 self._stable_ctr = min(self._stable_ctr + 1, STABLE_COUNT + 1)
             else:
@@ -339,114 +369,84 @@ class ScaleManager:
 
             with self._out_lock:
                 self._out = {
-                    "kg":       kg_vals,
-                    "ema_kg":   ema_ch,
-                    "mean_kg":  mean_kg,
-                    "ema_mean": ema_mean,
-                    "stable":   stable,
-                    "diag":     diags,
+                    "kg": kg_vals, "ema_kg": ema_ch, "mean_kg": mean_kg,
+                    "ema_mean": ema_mean, "stable": stable, "diag": diags,
+                    "uart_ok": link_ok,
                 }
-
-    # ── Public API ─────────────────────────────────────────────────────────
-    def start(self):
-        t1 = threading.Thread(target=self._acq_loop,  daemon=True, name="hx711-acq")
-        t2 = threading.Thread(target=self._proc_loop, daemon=True, name="hx711-proc")
-        t1.start()
-        t2.start()
-        log.info("HX711 acquisition + processing threads started")
 
     def get_values(self) -> dict:
         with self._out_lock:
             return dict(self._out)
 
-    def _pause_acq(self, timeout=3.0) -> bool:
-        self._paused.clear()
-        self._pause.set()
-        ok = self._paused.wait(timeout)
-        if not ok:
-            log.error("Acquisition thread did not pause in time")
-            self._pause.clear()
-        return ok
-
-    def _resume_acq(self):
-        self._pause.clear()
-
     def tare(self) -> bool:
-        log.info("Tare: pausing acquisition…")
-        if not self._pause_acq():
-            return False
-
-        log.info("Tare: reading 20 samples per cell…")
+        """Pi-side tare: zero the current filtered raw baseline. Call
+        combined_tare() instead if you also want the ESP32 zeroed first."""
+        snap = self.uart.get_snapshot()
         new_offsets = []
         ok = True
-
-        for i, cell in enumerate(self._cells):
-            avg = cell.read_average(20)
-            if avg is None:
-                log.error(f"Tare: cell {i} failed")
+        for i in range(4):
+            buf = snap[i]
+            if len(buf) < 3:
+                log.error(f"Tare: channel {i} has no data yet")
                 ok = False
-                new_offsets.append(self.cfg["offsets"][i])  # keep old
+                new_offsets.append(self.cfg["offsets"][i])
             else:
-                log.info(f"  Cell {i}: offset={avg:.1f}")
-                new_offsets.append(avg)
-
-        self._resume_acq()
+                new_offsets.append(_trimmed_mean(buf))
 
         if ok:
             self.cfg["offsets"] = new_offsets
             save_config(self.cfg)
-            # Reset EMA to zero
             with self._out_lock:
-                self._ema_ch   = [0.0] * self._n
-                self._ema_mean = 0.0
-                self._prev_ema = 0.0
+                self._ema_ch, self._ema_mean, self._prev_ema = [0.0]*4, 0.0, 0.0
                 self._stable_ctr = 0
-            log.info(f"Tare done — offsets: {[round(o) for o in new_offsets]}")
-
+            log.info(f"Pi-side tare done — offsets: {[round(o) for o in new_offsets]}")
         return ok
+
+    def combined_tare(self) -> bool:
+        """Full tare: ESP32 zeroes its own baseline first, then the Pi
+        zeroes whatever the (now-fresh) stream reads as."""
+        esp_ok = self.uart.send_tare()
+        if esp_ok:
+            log.info("ESP32-side tare OK")
+        else:
+            log.warning("ESP32-side tare failed or unavailable — continuing with Pi-side tare only")
+        time.sleep(0.3)  # let a few post-tare packets arrive
+        return self.tare()
 
     def calibrate(self, known_kg: float) -> bool:
         if known_kg <= 0:
             log.error(f"Calibrate: invalid known_kg={known_kg}")
             return False
 
-        log.info(f"Calibrate: {known_kg:.4f} kg — pausing acquisition…")
-        if not self._pause_acq():
-            return False
-
-        log.info("Calibrate: reading 20 samples per cell…")
+        snap = self.uart.get_snapshot()
         new_factors = []
-        valid       = []
+        valid = []
 
-        for i, cell in enumerate(self._cells):
-            avg = cell.read_average(20)
-            if avg is None:
-                log.warning(f"  Cell {i}: no reads — skipping")
+        for i in range(4):
+            buf = snap[i]
+            if len(buf) < 3:
+                log.warning(f"Calibrate: channel {i} has no data — skipping")
                 new_factors.append(None)
                 continue
 
+            avg = _trimmed_mean(buf)
             net = avg - self.cfg["offsets"][i]
-            log.info(f"  Cell {i}: avg={avg:.1f} offset={self.cfg['offsets'][i]:.1f} net={net:.1f}")
-
             if abs(net) < 500:
-                log.warning(f"  Cell {i}: net_raw too small ({net:.1f}) — skipping")
+                log.warning(f"Calibrate: channel {i} net too small ({net:.1f}) — skipping")
                 new_factors.append(None)
                 continue
 
             factor = net / known_kg
             if not (100 <= abs(factor) <= 5_000_000):
-                log.warning(f"  Cell {i}: factor={factor:.1f} out of range — skipping")
+                log.warning(f"Calibrate: channel {i} factor={factor:.1f} out of range — skipping")
                 new_factors.append(None)
                 continue
 
-            log.info(f"  Cell {i}: factor={factor:.2f} ✓")
             new_factors.append(factor)
             valid.append(factor)
 
-        self._resume_acq()
-
         if not valid:
-            log.error("Calibrate: no valid factors — check wiring and weight")
+            log.error("Calibrate: no valid factors — check load placement / wiring")
             return False
 
         mean_f = sum(valid) / len(valid)
@@ -456,10 +456,13 @@ class ScaleManager:
         log.info(f"Calibrate done — factors: {[round(f) for f in final]}")
         return True
 
+    def diagnostics(self) -> dict:
+        return {**self.uart.stats(), "offsets": self.cfg["offsets"],
+                "cal_factors": self.cfg["cal_factors"]}
+
     def cleanup(self):
         self._stop.set()
-        if HW_AVAILABLE:
-            GPIO.cleanup()
+        self.uart.cleanup()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -470,7 +473,8 @@ _shared = {
     "weights": [0.0]*4, "mean": 0.0,
     "status": "idle", "countdown": 0,
     "last_photo": "", "stable": False,
-    "diag": ["no_data"]*4,
+    "diag": ["no_data"]*4, "uart_ok": False,
+    "autocapture_enabled": True,
 }
 _shared_lock = threading.Lock()
 
@@ -483,8 +487,63 @@ def get_shared() -> dict:
         return dict(_shared)
 
 
+# Module-level handle to the running ScaleManager, so web_server.py (running
+# in the same process, via launcher.py) can drive tare/calibrate through the
+# SAME UART connection instead of opening a second, conflicting one.
+_scale_manager = None
+
+def get_scale_manager():
+    return _scale_manager
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# CAMERA
+# HARDWARE CAPTURE BUTTON — GPIO17, grounded = pressed
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    import RPi.GPIO as GPIO
+    GPIO_AVAILABLE = True
+except ImportError:
+    GPIO_AVAILABLE = False
+    log.warning("RPi.GPIO not available — hardware capture button disabled")
+
+
+class CaptureButton:
+    def __init__(self, pin: int):
+        self.pin = pin
+        self.event = threading.Event()
+        self._enabled = False
+        if GPIO_AVAILABLE:
+            try:
+                GPIO.setmode(GPIO.BCM)
+                GPIO.setwarnings(False)
+                GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                GPIO.add_event_detect(pin, GPIO.FALLING,
+                                       callback=self._on_press, bouncetime=250)
+                self._enabled = True
+                log.info(f"Capture button armed on GPIO{pin}")
+            except Exception as e:
+                log.error(f"Capture button setup failed on GPIO{pin}: {e}")
+
+    def _on_press(self, channel):
+        self.event.set()
+
+    def consume(self) -> bool:
+        """Returns True exactly once per press."""
+        if self.event.is_set():
+            self.event.clear()
+            return True
+        return False
+
+    def cleanup(self):
+        if self._enabled:
+            try:
+                GPIO.remove_event_detect(self.pin)
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CAMERA  (unchanged)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Camera:
@@ -561,65 +620,7 @@ class Camera:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PYGAME HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-COL_WHITE  = (255, 255, 255)
-COL_BLACK  = (0,   0,   0  )
-COL_GREEN  = (0,   210, 0  )
-COL_YELLOW = (230, 200, 0  )
-COL_RED    = (220, 50,  50 )
-COL_ORANGE = (230, 130, 0  )
-COL_STRIP  = (22,  22,  22 )
-COL_LINE   = (65,  65,  65 )
-
-def make_fonts():
-    return {
-        "small":  pygame.font.SysFont("monospace", 17),
-        "medium": pygame.font.SysFont("monospace", 22),
-        "large":  pygame.font.SysFont("monospace", 68, bold=True),
-    }
-
-def frame_to_surface(frame, w, h):
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    if frame.shape[1] != w or frame.shape[0] != h:
-        rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
-    return pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
-
-def draw_strip(screen, fonts, vals, labels, strip_y, dw, sh):
-    pygame.draw.rect(screen, COL_STRIP, (0, strip_y, dw, sh))
-    pygame.draw.line(screen, COL_LINE,  (0, strip_y), (dw, strip_y), 1)
-
-    ema  = vals["ema_kg"]
-    mean = vals["ema_mean"]
-    stbl = vals["stable"]
-
-    parts = [f"{labels[i]}: {ema[i]:.3f}kg" for i in range(4)]
-    mean_txt = f"MEAN: {mean:.3f}kg" + (" ✓" if stbl else "")
-    text = "   |   ".join(parts) + "   |   " + mean_txt
-
-    col  = (0, 210, 0) if stbl else COL_WHITE
-    surf = fonts["small"].render(text, True, col)
-    tx   = max(8, (dw - surf.get_width()) // 2)
-    ty   = strip_y + (sh - surf.get_height()) // 2
-    screen.blit(surf, (tx, ty))
-
-def draw_countdown(screen, fonts, secs, dw, dh):
-    txt    = f"Photo in {secs:.1f}s"
-    shadow = fonts["large"].render(txt, True, COL_BLACK)
-    surf   = fonts["large"].render(txt, True, COL_YELLOW)
-    cx = (dw - surf.get_width())  // 2
-    cy = (dh - surf.get_height()) // 2
-    screen.blit(shadow, (cx+2, cy+2))
-    screen.blit(surf,   (cx,   cy  ))
-
-def draw_msg(screen, fonts, text, color):
-    surf = fonts["medium"].render(text, True, color)
-    screen.blit(surf, (10, 10))
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHOTO SAVE
+# PHOTO SAVE + STORAGE CAP
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def save_photo(frame, vals, labels, strip_h) -> str:
@@ -646,19 +647,239 @@ def save_photo(frame, vals, labels, strip_h) -> str:
     return path
 
 
+def enforce_storage_cap(max_mb: int):
+    """Deletes the oldest photos until the photos/ folder is back under
+    the configured cap. Runs after every save; cheap (folder is small)."""
+    try:
+        cap_bytes = max_mb * 1024 * 1024
+        files = sorted(Path(PHOTOS_DIR).glob("*.jpg"), key=os.path.getmtime)
+        total = sum(f.stat().st_size for f in files)
+        removed = 0
+        while total > cap_bytes and files:
+            oldest = files.pop(0)
+            total -= oldest.stat().st_size
+            oldest.unlink()
+            removed += 1
+        if removed:
+            log.info(f"Storage cap: removed {removed} oldest photo(s), "
+                      f"now {total/1024/1024:.1f}MB / {max_mb}MB")
+    except Exception as e:
+        log.error(f"Storage cap check failed: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# USB EXPORT  — zips photos/ and copies it to an inserted USB drive
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _find_usb_partition():
+    """Returns a /dev/sdXN path for the first USB-attached partition with a
+    filesystem, or None if nothing suitable is found."""
+    try:
+        out = subprocess.run(
+            ["lsblk", "-J", "-o", "NAME,TRAN,TYPE,FSTYPE,MOUNTPOINT"],
+            capture_output=True, text=True, timeout=5, check=True
+        ).stdout
+        data = json.loads(out)
+    except Exception as e:
+        log.error(f"USB export: lsblk failed: {e}")
+        return None
+
+    for dev in data.get("blockdevices", []):
+        if dev.get("tran") != "usb":
+            continue
+        for child in dev.get("children", []) or []:
+            if child.get("type") == "part" and child.get("fstype"):
+                return f"/dev/{child['name']}"
+    return None
+
+
+def _udisks_mount(devpath: str):
+    try:
+        r = subprocess.run(["udisksctl", "mount", "-b", devpath],
+                            capture_output=True, text=True, timeout=15)
+        combined = (r.stdout or "") + (r.stderr or "")
+        m = re.search(r"at (\S+)", combined)
+        if m:
+            return m.group(1).rstrip(".")
+        return None
+    except Exception as e:
+        log.error(f"USB export: mount failed: {e}")
+        return None
+
+
+def _udisks_unmount(devpath: str):
+    try:
+        subprocess.run(["udisksctl", "unmount", "-b", devpath],
+                        capture_output=True, text=True, timeout=15)
+    except Exception as e:
+        log.warning(f"USB export: unmount failed (drive can still be removed): {e}")
+
+
+def export_photos_to_usb(status_cb):
+    """Zips PHOTOS_DIR and copies the zip to a plugged-in USB drive.
+    status_cb(text) is called with short progress strings the caller can
+    show on screen. Never deletes anything from the Pi."""
+    status_cb("Looking for USB drive...")
+    dev = _find_usb_partition()
+    if not dev:
+        status_cb("No USB drive found")
+        return False
+
+    status_cb("Mounting drive...")
+    mount_point = _udisks_mount(dev)
+    if not mount_point:
+        status_cb("Mount failed")
+        return False
+
+    try:
+        status_cb("Zipping photos...")
+        photos = list(Path(PHOTOS_DIR).glob("*.jpg"))
+        if not photos:
+            status_cb("No photos to export")
+            return False
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        zip_name = f"smartscale_photos_{ts}.zip"
+        tmp_zip = os.path.join(tempfile.gettempdir(), zip_name)
+        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:
+            for p in photos:
+                zf.write(p, p.name)
+
+        status_cb("Copying to USB...")
+        shutil.copy(tmp_zip, os.path.join(mount_point, zip_name))
+        os.remove(tmp_zip)
+
+        status_cb("Transfer complete!")
+        log.info(f"USB export: {len(photos)} photos -> {mount_point}/{zip_name}")
+        return True
+    except Exception as e:
+        log.error(f"USB export failed: {e}")
+        status_cb(f"Export failed: {e}")
+        return False
+    finally:
+        _udisks_unmount(dev)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PYGAME HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+COL_WHITE  = (255, 255, 255)
+COL_BLACK  = (0,   0,   0  )
+COL_GREEN  = (0,   210, 0  )
+COL_YELLOW = (230, 200, 0  )
+COL_RED    = (220, 50,  50 )
+COL_ORANGE = (230, 130, 0  )
+COL_STRIP  = (22,  22,  22 )
+COL_LINE   = (65,  65,  65 )
+COL_BTN    = (45,  45,  45 )
+COL_BTN_ON = (35,  110, 35 )
+COL_BTN_BORDER = (90, 90, 90)
+
+def make_fonts():
+    return {
+        "small":  pygame.font.SysFont("monospace", 17),
+        "medium": pygame.font.SysFont("monospace", 22),
+        "large":  pygame.font.SysFont("monospace", 68, bold=True),
+    }
+
+def frame_to_surface(frame, w, h):
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if frame.shape[1] != w or frame.shape[0] != h:
+        rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+    return pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
+
+def draw_strip(screen, fonts, vals, labels, strip_y, dw, sh):
+    pygame.draw.rect(screen, COL_STRIP, (0, strip_y, dw, sh))
+    pygame.draw.line(screen, COL_LINE,  (0, strip_y), (dw, strip_y), 1)
+
+    ema  = vals["ema_kg"]
+    mean = vals["ema_mean"]
+    stbl = vals["stable"]
+    uart_ok = vals.get("uart_ok", True)
+
+    parts = [f"{labels[i]}: {ema[i]:.3f}kg" for i in range(4)]
+    mean_txt = f"MEAN: {mean:.3f}kg" + (" \u2713" if stbl else "")
+    text = "   |   ".join(parts) + "   |   " + mean_txt
+    if not uart_ok:
+        text = "ESP32 LINK LOST — " + text
+
+    col  = COL_RED if not uart_ok else ((0, 210, 0) if stbl else COL_WHITE)
+    surf = fonts["small"].render(text, True, col)
+    tx   = max(8, (dw - surf.get_width()) // 2)
+    ty   = strip_y + (sh - surf.get_height()) // 2
+    screen.blit(surf, (tx, ty))
+
+def draw_countdown(screen, fonts, secs, dw, dh):
+    txt    = f"Photo in {secs:.1f}s"
+    shadow = fonts["large"].render(txt, True, COL_BLACK)
+    surf   = fonts["large"].render(txt, True, COL_YELLOW)
+    cx = (dw - surf.get_width())  // 2
+    cy = (dh - surf.get_height()) // 2
+    screen.blit(shadow, (cx+2, cy+2))
+    screen.blit(surf,   (cx,   cy  ))
+
+def draw_msg(screen, fonts, text, color, y=10):
+    surf = fonts["medium"].render(text, True, color)
+    screen.blit(surf, (10, y))
+
+
+# ── Control bar (top strip): TARE | CAPTURE | AUTO [slider] | EXPORT USB ────
+def make_control_rects(dw, bar_h):
+    margin = 8
+    n = 4
+    w = (dw - margin * (n + 1)) // n
+    rects = {}
+    x = margin
+    for name in ("tare", "capture", "auto", "export"):
+        rects[name] = pygame.Rect(x, 4, w, bar_h - 8)
+        x += w + margin
+    return rects
+
+def draw_control_bar(screen, fonts, rects, dw, bar_h, autocapture_on,
+                      busy_name, status_text):
+    pygame.draw.rect(screen, COL_STRIP, (0, 0, dw, bar_h))
+    pygame.draw.line(screen, COL_LINE, (0, bar_h), (dw, bar_h), 1)
+
+    def draw_btn(rect, label, on=False, busy=False):
+        color = COL_BTN_ON if on else COL_BTN
+        pygame.draw.rect(screen, color, rect, border_radius=6)
+        pygame.draw.rect(screen, COL_BTN_BORDER, rect, 1, border_radius=6)
+        txt = "..." if busy else label
+        surf = fonts["small"].render(txt, True, COL_WHITE)
+        screen.blit(surf, (rect.x + (rect.w - surf.get_width()) // 2,
+                            rect.y + (rect.h - surf.get_height()) // 2))
+
+    draw_btn(rects["tare"],    "TARE")
+    draw_btn(rects["capture"], "CAPTURE", busy=(busy_name == "capture"))
+    draw_btn(rects["auto"],    f"AUTO: {'ON' if autocapture_on else 'OFF'}",
+             on=autocapture_on)
+    draw_btn(rects["export"],  "EXPORT USB", busy=(busy_name == "export"))
+
+    if status_text:
+        surf = fonts["small"].render(status_text, True, COL_YELLOW)
+        screen.blit(surf, (dw - surf.get_width() - 10,
+                            bar_h + 6))
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def main():
+    global _scale_manager
     cfg = load_config()
 
-    # ── Scale: start acquisition first, then tare ──────────────────────────
+    # ── Scale: start acquisition, then combined tare (ESP32 + Pi) ──────────
     scale = ScaleManager(cfg)
+    _scale_manager = scale
     scale.start()
-    log.info("Startup tare — platform must be EMPTY. Waiting 5s for sensors…")
-    time.sleep(5)
-    scale.tare()
+    log.info("Startup tare — platform must be EMPTY. Waiting 3s for UART link...")
+    time.sleep(3)
+    scale.combined_tare()
+
+    # ── Hardware capture button ─────────────────────────────────────────────
+    button = CaptureButton(cfg["button_gpio"])
 
     # ── Camera ─────────────────────────────────────────────────────────────
     cam    = Camera(cfg["camera_index"],
@@ -675,12 +896,16 @@ def main():
     pygame.mouse.set_visible(False)
     fonts   = make_fonts()
     clock   = pygame.time.Clock()
+
     strip_h = cfg["weight_strip_height"]
     strip_y = DH - strip_h
+    bar_h   = cfg["control_bar_height"]
+    ctrl_rects = make_control_rects(DW, bar_h)
 
     trigger_kg  = cfg["trigger_weight_kg"]
     stabilise_s = cfg["stabilise_seconds"]
     labels      = cfg["cell_labels"]
+    autocapture = cfg["autocapture_enabled"]
 
     state         = "idle"
     countdown_end = 0.0
@@ -689,19 +914,77 @@ def main():
     remaining     = 0.0
     cfg_mtime     = 0.0
 
+    busy_name    = None    # "capture" / "export" while a background job runs
+    status_text  = ""
+    status_until = 0.0
+
+    def set_status(text, seconds=4.0):
+        nonlocal status_text, status_until
+        status_text = text
+        status_until = time.time() + seconds
+
+    def do_manual_capture():
+        nonlocal state, last_photo, cooldown_end, busy_name
+        busy_name = "capture"
+        vals = scale.get_values()
+        frame = cam.capture_photo() if cam_ok else None
+        if frame is not None:
+            last_photo = save_photo(frame, vals, labels, strip_h)
+            enforce_storage_cap(cfg["photos_max_mb"])
+            set_status("Photo saved!")
+        else:
+            set_status("Capture failed — no camera frame")
+        state = "cooldown"
+        cooldown_end = time.time() + 3.0
+        busy_name = None
+
+    def do_tare():
+        nonlocal busy_name
+        busy_name = "tare"
+        set_status("Taring...", 30)
+        ok = scale.combined_tare()
+        set_status("Tare complete" if ok else "Tare finished with errors")
+        busy_name = None
+
+    def do_export():
+        nonlocal busy_name
+        busy_name = "export"
+        def cb(text):
+            set_status(text, 6)
+        export_photos_to_usb(cb)
+        busy_name = None
+
     log.info("Main loop started")
 
     while True:
         # ── Events ─────────────────────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                cam.stop(); pygame.quit(); scale.cleanup(); return
+                cam.stop(); button.cleanup(); pygame.quit(); scale.cleanup(); return
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_q:
-                    cam.stop(); pygame.quit(); scale.cleanup()
+                    cam.stop(); button.cleanup(); pygame.quit(); scale.cleanup()
                     log.info("Stopped"); return
                 elif event.key == pygame.K_t:
-                    threading.Thread(target=scale.tare, daemon=True).start()
+                    threading.Thread(target=do_tare, daemon=True).start()
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                pos = event.pos
+                if busy_name is None:
+                    if ctrl_rects["tare"].collidepoint(pos):
+                        threading.Thread(target=do_tare, daemon=True).start()
+                    elif ctrl_rects["capture"].collidepoint(pos):
+                        threading.Thread(target=do_manual_capture, daemon=True).start()
+                    elif ctrl_rects["auto"].collidepoint(pos):
+                        autocapture = not autocapture
+                        cfg["autocapture_enabled"] = autocapture
+                        save_config(cfg)
+                        set_status(f"Autocapture {'ON' if autocapture else 'OFF'}", 2)
+                    elif ctrl_rects["export"].collidepoint(pos):
+                        threading.Thread(target=do_export, daemon=True).start()
+
+        # ── Hardware button ──────────────────────────────────────────────
+        if button.consume() and busy_name is None:
+            threading.Thread(target=do_manual_capture, daemon=True).start()
 
         # ── Config hot-reload ───────────────────────────────────────────
         try:
@@ -715,6 +998,7 @@ def main():
                 labels      = cfg["cell_labels"]
                 strip_h     = cfg["weight_strip_height"]
                 strip_y     = DH - strip_h
+                autocapture = cfg["autocapture_enabled"]
                 log.info("Config reloaded")
         except Exception:
             pass
@@ -724,9 +1008,11 @@ def main():
         mean_kg = vals["ema_mean"]
         now     = time.time()
 
-        # ── State machine ───────────────────────────────────────────────
+        update_shared(autocapture_enabled=autocapture, uart_ok=vals.get("uart_ok", False))
+
+        # ── State machine (only auto-triggers when autocapture is ON) ────
         if state == "idle":
-            if mean_kg >= trigger_kg:
+            if autocapture and mean_kg >= trigger_kg:
                 state         = "countdown"
                 countdown_end = now + stabilise_s
                 log.info(f"Trigger: {mean_kg:.3f}kg")
@@ -735,13 +1021,16 @@ def main():
 
         elif state == "countdown":
             remaining = countdown_end - now
-            if mean_kg < trigger_kg:
+            if not autocapture:
+                state = "idle"
+            elif mean_kg < trigger_kg:
                 state = "idle"
                 log.info("Weight removed — cancelled")
             elif remaining <= 0:
                 photo_frame = cam.capture_photo() if cam_ok else None
                 if photo_frame is not None:
                     last_photo = save_photo(photo_frame, vals, labels, strip_h)
+                    enforce_storage_cap(cfg["photos_max_mb"])
                 state        = "cooldown"
                 cooldown_end = now + 3.0
             update_shared(weights=vals["ema_kg"], mean=mean_kg,
@@ -762,21 +1051,21 @@ def main():
         else:
             screen.fill(COL_BLACK)
             if cam_ok:
-                draw_msg(screen, fonts, "Waiting for camera…", COL_ORANGE)
+                draw_msg(screen, fonts, "Waiting for camera...", COL_ORANGE, y=bar_h + 10)
 
-        if state == "countdown":
+        if state == "countdown" and autocapture:
             draw_countdown(screen, fonts, remaining, DW, DH)
-        elif state == "cooldown":
-            draw_msg(screen, fonts, "Photo saved!", COL_GREEN)
+        elif state == "cooldown" and status_text == "":
+            draw_msg(screen, fonts, "Photo saved!", COL_GREEN, y=bar_h + 10)
+
+        if status_text and now > status_until:
+            status_text = ""
 
         draw_strip(screen, fonts, vals, labels, strip_y, DW, strip_h)
+        draw_control_bar(screen, fonts, ctrl_rects, DW, bar_h, autocapture,
+                          busy_name, status_text)
         pygame.display.flip()
         clock.tick(20)
-
-    cam.stop()
-    pygame.quit()
-    scale.cleanup()
-    log.info("Stopped")
 
 
 if __name__ == "__main__":

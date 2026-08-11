@@ -1,6 +1,6 @@
 """
 Smart Scale — Unified Launcher
-Starts both the Flask web server and the OpenCV scale display in one process.
+Starts both the Flask web server and the pygame scale display in one process.
 Run this file directly: python3 launcher.py
 """
 
@@ -13,7 +13,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
     handlers=[
-        logging.FileHandler("/home/pi/smartscale/scale.log"),
+        logging.FileHandler("/home/melody/smartscale/scale.log"),
         logging.StreamHandler(sys.stdout),
     ]
 )
@@ -44,7 +44,8 @@ if __name__ == "__main__":
     web_thread = threading.Thread(target=run_web, daemon=True, name="web-server")
     web_thread.start()
 
-    # Scale app runs on main thread (OpenCV requires main thread on some systems)
+    # Scale app runs on main thread (pygame + hardware GPIO interrupts are
+    # happiest on the main thread on some systems).
     run_scale()
 
     log.info("Scale app exited — launcher stopping")

@@ -22,6 +22,8 @@
   .live-bar .label { color: #888; }
   .live-bar .val { color: #5f5; font-weight: bold; }
   .live-bar .status { color: #ff5; }
+  .live-bar .link-ok { color: #5f5; }
+  .live-bar .link-bad { color: #f55; font-weight: bold; }
 
   nav { background: #1e1e1e; border-bottom: 1px solid #333;
         padding: .5rem 1.2rem; display: flex; gap: .8rem; flex-wrap: wrap; }
@@ -102,6 +104,11 @@
   hr.section { border: none; border-top: 1px solid #333; margin: 1rem 0; }
   .section-label { color: #777; font-size: .78rem; text-transform: uppercase;
                    letter-spacing: 1px; margin-bottom: .6rem; }
+
+  /* ── Storage bar ── */
+  .storage-bar-outer { background: #1a1a1a; border: 1px solid #444; height: 14px;
+                        width: 100%; margin: .5rem 0; }
+  .storage-bar-inner { background: #2a7a2a; height: 100%; }
 </style>
 </head>
 <body>
@@ -122,14 +129,20 @@
         <span class="val" id="wmean">{{ "%.1f"|format(live.mean) }}{{ cfg.unit }}</span></span>
   <span><span class="label">Status:</span>
         <span class="status" id="wstatus">{{ live.status }}</span></span>
+  <span><span class="label">ESP32 link:</span>
+        <span id="linkstatus" class="{{ 'link-ok' if live.uart_ok else 'link-bad' }}">
+          {{ 'CONNECTED' if live.uart_ok else 'DISCONNECTED' }}</span></span>
+  <span><span class="label">Autocapture:</span>
+        <span id="autostatus">{{ 'ON' if live.autocapture_enabled else 'OFF' }}</span></span>
 </div>
 
 <!-- Section nav -->
 <nav>
   <a href="#scale">Scale</a>
   <a href="#calibration">Calibration</a>
-  <a href="#gpio">GPIO</a>
+  <a href="#uart">UART / Button</a>
   <a href="#display">Display</a>
+  <a href="#storage">Storage</a>
   <a href="#wifi">WiFi</a>
   <a href="#photos">Photos</a>
   <a href="#system">System</a>
@@ -154,12 +167,12 @@
         <div class="field w160">
           <label>Trigger Weight (kg)</label>
           <input type="number" step="0.001" name="trigger_weight_kg" value="{{ cfg.trigger_weight_kg }}">
-          <span class="hint">Capture fires above this (after tare)</span>
+          <span class="hint">Autocapture fires above this (after tare)</span>
         </div>
         <div class="field w160">
           <label>Stabilise Delay (s)</label>
           <input type="number" step="0.5" min="1" max="30" name="stabilise_seconds" value="{{ cfg.stabilise_seconds }}">
-          <span class="hint">Countdown before photo is taken</span>
+          <span class="hint">Countdown before an autocapture photo is taken. The on-screen/hardware capture button always fires immediately, ignoring this.</span>
         </div>
         <div class="field w120">
           <label>Display Unit</label>
@@ -185,6 +198,12 @@
         <button class="btn btn-green" type="submit">Save Scale Settings</button>
       </div>
     </form>
+    <hr class="section">
+    <p class="hint">
+      Autocapture ON/OFF is controlled from the on-screen slider on the touchscreen
+      itself (top control bar), not here — it needs to be reachable without opening
+      this page. This page just shows its current state above in the live bar.
+    </p>
   </div>
 </div>
 
@@ -196,7 +215,9 @@
 
     <p class="section-label">Step 1 — Tare (Zero the scale)</p>
     <p style="color:#888;font-size:.82rem;margin-bottom:.7rem;">
-      Remove everything from the platform, then press Tare.
+      Remove everything from the platform, then press Tare. This tares BOTH
+      the ESP32's own baseline and the Pi's calibration offset — same as the
+      on-screen TARE button and what happens automatically at startup.
     </p>
     <form method="POST" action="/tare">
       <button class="btn btn-orange" type="submit">Run Tare Now</button>
@@ -222,7 +243,9 @@
     <hr class="section">
     <p class="section-label">Manual Calibration Values (Advanced)</p>
     <p style="color:#888;font-size:.82rem;margin-bottom:.7rem;">
-      Edit raw offsets and factors directly. Only change if you know what you're doing.
+      Edit raw offsets and factors directly. Offsets are in raw ESP32 counts
+      (post ESP32-side tare), factors convert raw counts to kg. Only change
+      if you know what you're doing.
     </p>
     <form method="POST" action="/save_cal_manual">
       <table class="cal">
@@ -259,31 +282,37 @@
 </div>
 
 
-<!-- ══ GPIO SETTINGS ═══════════════════════════════════════════════════════ -->
-<div class="card" id="gpio">
-  <div class="card-header"><h2>GPIO / HX711 PINS  <small style="color:#666;font-weight:normal">(BCM numbering)</small></h2></div>
+<!-- ══ UART / BUTTON SETTINGS ══════════════════════════════════════════════ -->
+<div class="card" id="uart">
+  <div class="card-header"><h2>UART LINK &amp; CAPTURE BUTTON</h2></div>
   <div class="card-body">
     <p style="color:#f88;font-size:.82rem;margin-bottom:.8rem;">
       ⚠ Changes take effect after restarting the scale app.
     </p>
-    <form method="POST" action="/save_gpio">
+    <form method="POST" action="/save_uart">
       <div class="form-row">
-        <div class="field w120">
-          <label>CLK Pin (shared)</label>
-          <input type="number" name="clk_pin" value="{{ cfg.clk_pin }}">
+        <div class="field w200">
+          <label>UART Port</label>
+          <input type="text" name="uart_port" value="{{ cfg.uart_port }}">
+          <span class="hint">Pi's hardware UART, e.g. /dev/serial0</span>
+        </div>
+        <div class="field w160">
+          <label>Baud Rate</label>
+          <input type="number" name="uart_baud" value="{{ cfg.uart_baud }}">
+        </div>
+        <div class="field w160">
+          <label>Capture Button GPIO (BCM)</label>
+          <input type="number" name="button_gpio" value="{{ cfg.button_gpio }}">
+          <span class="hint">Grounded = capture</span>
         </div>
       </div>
-      <div class="form-row">
-        {% for i in range(4) %}
-        <div class="field w120">
-          <label>DOUT — Cell {{ i+1 }} ({{ cfg.cell_labels[i] }})</label>
-          <input type="number" name="dout{{ i }}" value="{{ cfg.dout_pins[i] }}">
-        </div>
-        {% endfor %}
-      </div>
-      <p class="hint">Default wiring: CLK=GPIO6, DOUT=GPIO5/13/19/26 (all on physical pins 29–37)</p>
+      <p class="hint">
+        The ESP32 reads all 4 HX711 chips and streams raw values here over
+        UART — the Pi no longer has any HX711 wiring of its own. See SETUP.md
+        for the ESP32↔Pi wiring diagram.
+      </p>
       <div class="btn-row">
-        <button class="btn btn-green" type="submit">Save GPIO Settings</button>
+        <button class="btn btn-green" type="submit">Save UART / Button Settings</button>
       </div>
     </form>
   </div>
@@ -313,6 +342,34 @@
       </div>
       <div class="btn-row">
         <button class="btn btn-green" type="submit">Save Display Settings</button>
+      </div>
+    </form>
+  </div>
+</div>
+
+
+<!-- ══ STORAGE ═════════════════════════════════════════════════════════════ -->
+<div class="card" id="storage">
+  <div class="card-header"><h2>PHOTO STORAGE</h2></div>
+  <div class="card-body">
+    <p style="color:#888;font-size:.82rem;margin-bottom:.6rem;">
+      When the photos folder grows past this size, the OLDEST photos are
+      deleted automatically to make room — checked after every capture.
+    </p>
+    <p>{{ photos_size_mb }} MB used of {{ cfg.photos_max_mb }} MB cap</p>
+    <div class="storage-bar-outer">
+      <div class="storage-bar-inner" style="width: {{ ([100, (photos_size_mb / cfg.photos_max_mb * 100)]|min)|round(1) }}%;"></div>
+    </div>
+    <form method="POST" action="/save_storage">
+      <div class="form-row">
+        <div class="field w200">
+          <label>Storage Cap (MB)</label>
+          <input type="number" name="photos_max_mb" value="{{ cfg.photos_max_mb }}">
+          <span class="hint">32GB SD card — default leaves headroom for the OS</span>
+        </div>
+      </div>
+      <div class="btn-row">
+        <button class="btn btn-green" type="submit">Save Storage Cap</button>
       </div>
     </form>
   </div>
@@ -359,6 +416,11 @@
     </div>
   </div>
   <div class="card-body">
+    <p class="hint" style="margin-bottom:.8rem;">
+      This ZIP download is the same thing the on-screen "EXPORT USB" button
+      writes to a plugged-in USB drive directly at the scale — use whichever
+      is more convenient.
+    </p>
     {% if not photos %}
     <p style="color:#666;font-size:.85rem;">No photos captured yet.</p>
     {% else %}
@@ -393,7 +455,7 @@
       </form>
     </div>
     <p class="hint" style="margin-top:.4rem;">
-      Required after changing GPIO or display settings.
+      Required after changing UART, button, or display settings.
     </p>
 
     <hr class="section">
@@ -411,10 +473,10 @@
 
     <hr class="section">
     <p class="section-label">Config File</p>
-    <p style="color:#666;font-size:.8rem;">{{ "/home/pi/smartscale/config.json" }}</p>
-    <p style="color:#666;font-size:.8rem;">Photos: {{ "/home/pi/smartscale/photos/" }}</p>
-    <p style="color:#666;font-size:.8rem;">Log: {{ "/home/pi/smartscale/scale.log" }}</p>
-    <p style="color:#666;font-size:.8rem;">Web IP: 192.168.1.100:5000</p>
+    <p style="color:#666;font-size:.8rem;">/home/melody/smartscale/config.json</p>
+    <p style="color:#666;font-size:.8rem;">Photos: /home/melody/smartscale/photos/</p>
+    <p style="color:#666;font-size:.8rem;">Log: /home/melody/smartscale/scale.log</p>
+    <p style="color:#666;font-size:.8rem;">Web IP: http://raspi.local:5000 (or the Pi's static IP)</p>
   </div>
 </div>
 
@@ -438,6 +500,13 @@
           s.style.color = d.status === "countdown" ? "#ff5" :
                           d.status === "cooldown"   ? "#5f5" : "#aaa";
         }
+        const l = document.getElementById("linkstatus");
+        if (l) {
+          l.textContent = d.uart_ok ? "CONNECTED" : "DISCONNECTED";
+          l.className = d.uart_ok ? "link-ok" : "link-bad";
+        }
+        const a = document.getElementById("autostatus");
+        if (a) a.textContent = d.autocapture_enabled ? "ON" : "OFF";
       })
       .catch(() => {});
   }

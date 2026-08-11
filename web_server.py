@@ -60,18 +60,20 @@ def logout():
 # ── Config helpers ─────────────────────────────────────────────────────────────
 DEFAULT_CONFIG = {
     "display_width": 1024, "display_height": 600,
-    "weight_strip_height": 50,
+    "weight_strip_height": 50, "control_bar_height": 50,
     "trigger_weight_kg": 0.5,
     "stabilise_seconds": 5.0,
     "unit": "kg",
     "cell_labels": ["C1", "C2", "C3", "C4"],
-    "clk_pin": 6,
-    "dout_pins": [5, 13, 19, 26],
+    "uart_port": "/dev/serial0", "uart_baud": 115200,
+    "button_gpio": 17,
     "offsets": [0, 0, 0, 0],
     "cal_factors": [1.0, 1.0, 1.0, 1.0],
     "camera_index": 0,
     "stream_width": 640, "stream_height": 480,
     "photo_width": 1280, "photo_height": 720,
+    "autocapture_enabled": True,
+    "photos_max_mb": 20000,
 }
 
 def load_config():
@@ -81,8 +83,6 @@ def load_config():
                 cfg = json.load(f)
             for k, v in DEFAULT_CONFIG.items():
                 cfg.setdefault(k, v)
-            if "trigger_weight_g" in cfg and "trigger_weight_kg" not in cfg:
-                cfg["trigger_weight_kg"] = cfg.pop("trigger_weight_g") / 1000.0
             return cfg
         except Exception as e:
             log.error(f"Config read error: {e}")
@@ -103,8 +103,14 @@ def get_live():
             "weights": [0,0,0,0], "mean": 0,
             "status": "unknown", "countdown": 0,
             "last_photo": "", "stable": False,
-            "diag": ["no_data"]*4
+            "diag": ["no_data"]*4, "uart_ok": False,
+            "autocapture_enabled": True,
         }
+
+
+def _photos_folder_size_mb():
+    total = sum(p.stat().st_size for p in Path(PHOTOS_DIR).glob("*.jpg"))
+    return round(total / 1024 / 1024, 1)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────
@@ -119,7 +125,8 @@ def index():
         "size_kb": round(p.stat().st_size / 1024),
         "time":    datetime.fromtimestamp(p.stat().st_mtime).strftime("%d %b %Y  %H:%M:%S")
     } for p in photos]
-    return render_template("index.html", cfg=cfg, live=live, photos=photo_list)
+    return render_template("index.html", cfg=cfg, live=live, photos=photo_list,
+                            photos_size_mb=_photos_folder_size_mb())
 
 
 # ── Scale settings ─────────────────────────────────────────────────────────────
@@ -140,19 +147,20 @@ def save_scale():
     return redirect(url_for("index") + "#scale")
 
 
-# ── GPIO settings ──────────────────────────────────────────────────────────────
-@app.route("/save_gpio", methods=["POST"])
+# ── UART / hardware button settings (replaces old GPIO/HX711 pin settings) ─────
+@app.route("/save_uart", methods=["POST"])
 @login_required
-def save_gpio():
+def save_uart():
     cfg = load_config()
     try:
-        cfg["clk_pin"]   = int(request.form["clk_pin"])
-        cfg["dout_pins"] = [int(request.form[f"dout{i}"]) for i in range(4)]
+        cfg["uart_port"]   = request.form["uart_port"].strip()
+        cfg["uart_baud"]   = int(request.form["uart_baud"])
+        cfg["button_gpio"] = int(request.form["button_gpio"])
         save_config(cfg)
-        flash("GPIO settings saved. Restart the scale app to apply.", "ok")
+        flash("UART/button settings saved. Restart the scale app to apply.", "ok")
     except Exception as e:
         flash(f"Error: {e}", "err")
-    return redirect(url_for("index") + "#gpio")
+    return redirect(url_for("index") + "#uart")
 
 
 # ── Display settings ───────────────────────────────────────────────────────────
@@ -171,44 +179,42 @@ def save_display():
     return redirect(url_for("index") + "#display")
 
 
-# ── Calibration ────────────────────────────────────────────────────────────────
-def _direct_reads(cfg, n=20):
-    import time as _t
-    from scale_app import HX711Raw, ProcessingPipeline
-    import RPi.GPIO as GPIO
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setwarnings(False)
-    GPIO.setup(cfg["clk_pin"], GPIO.OUT, initial=GPIO.LOW)
-    cells    = [HX711Raw(dout, cfg["clk_pin"]) for dout in cfg["dout_pins"]]
-    per_cell = [[] for _ in range(len(cells))]
-    for _ in range(n):
-        for i, cell in enumerate(cells):
-            raw = cell.read()
-            if raw is not None:
-                per_cell[i].append(raw)
-        _t.sleep(0.015)
-    GPIO.cleanup()
-    return per_cell
+# ── Storage settings ────────────────────────────────────────────────────────────
+@app.route("/save_storage", methods=["POST"])
+@login_required
+def save_storage():
+    cfg = load_config()
+    try:
+        cfg["photos_max_mb"] = int(request.form["photos_max_mb"])
+        save_config(cfg)
+        flash("Storage cap saved.", "ok")
+    except Exception as e:
+        flash(f"Error: {e}", "err")
+    return redirect(url_for("index") + "#storage")
 
+
+# ── Calibration ────────────────────────────────────────────────────────────────
+# IMPORTANT: these routes drive the SAME ScaleManager/UARTReader instance the
+# running scale_app.py owns (launcher.py runs both in one process, so the
+# import below reaches the live object). They must NOT open a second serial
+# connection to the ESP32 — two readers on one UART port will corrupt both.
+
+def _get_live_scale():
+    from scale_app import get_scale_manager
+    scale = get_scale_manager()
+    if scale is None:
+        raise RuntimeError("Scale app is not running — start/restart the "
+                            "smartscale service first (System tab).")
+    return scale
 
 @app.route("/tare", methods=["POST"])
 @login_required
 def do_tare():
     try:
-        from scale_app import ProcessingPipeline
-        cfg      = load_config()
-        per_cell = _direct_reads(cfg, n=20)
-        offsets  = []
-        for i, buf in enumerate(per_cell):
-            if len(buf) < 5:
-                flash(f"Tare failed: cell {i} returned only {len(buf)} reads — check wiring.", "err")
-                return redirect(url_for("index") + "#calibration")
-            offsets.append(ProcessingPipeline._trimmed_mean(buf))
-        cfg["offsets"]     = offsets
-        cfg["cal_factors"] = [1.0, 1.0, 1.0, 1.0]
-        save_config(cfg)
-        log.info(f"Web tare done — offsets: {[round(o) for o in offsets]}")
-        flash("Tare complete — platform zeroed.", "ok")
+        scale = _get_live_scale()
+        ok = scale.combined_tare()
+        flash("Tare complete — platform zeroed." if ok else
+              "Tare finished with errors — check scale.log.", "ok" if ok else "err")
     except Exception as e:
         flash(f"Tare error: {e}", "err")
     return redirect(url_for("index") + "#calibration")
@@ -218,41 +224,20 @@ def do_tare():
 @login_required
 def do_calibrate():
     try:
-        from scale_app import ProcessingPipeline
-        cfg      = load_config()
         known_kg = float(request.form["known_weight_kg"])
         if known_kg <= 0:
             flash("Known weight must be greater than zero.", "err")
             return redirect(url_for("index") + "#calibration")
-        per_cell = _direct_reads(cfg, n=20)
-        offsets  = cfg["offsets"]
-        factors  = []
-        valid    = []
-        for i, buf in enumerate(per_cell):
-            if len(buf) < 5:
-                factors.append(None)
-                continue
-            net = ProcessingPipeline._trimmed_mean(buf) - offsets[i]
-            if abs(net) < 100:
-                factors.append(None)
-                continue
-            f = net / known_kg
-            if not (100 <= abs(f) <= 5_000_000):
-                factors.append(None)
-                continue
-            factors.append(f)
-            valid.append(f)
-        if not valid:
+        scale = _get_live_scale()
+        ok = scale.calibrate(known_kg)
+        if ok:
+            flash(f"Calibration done with {known_kg:.4f} kg reference.", "ok")
+        else:
             flash("Calibration failed — no valid factors. Check wiring and weight placement.", "err")
-            return redirect(url_for("index") + "#calibration")
-        mean_f = sum(valid) / len(valid)
-        cfg["cal_factors"] = [f if f is not None else mean_f for f in factors]
-        save_config(cfg)
-        log.info(f"Web calibration done — factors: {[round(f) for f in cfg['cal_factors']]}")
-        flash(f"Calibration done with {known_kg:.4f} kg reference.", "ok")
     except Exception as e:
         flash(f"Calibration error: {e}", "err")
     return redirect(url_for("index") + "#calibration")
+
 
 @app.route("/save_cal_manual", methods=["POST"])
 @login_required
@@ -368,22 +353,16 @@ def restart_scale():
 @app.route("/api/live")
 @login_required
 def api_live():
-    return jsonify(get_live())
+    live = get_live()
+    live["photos_size_mb"] = _photos_folder_size_mb()
+    return jsonify(live)
 
 @app.route("/api/diagnostics")
 @login_required
 def api_diagnostics():
     try:
-        from scale_app import ScaleManager
-        cfg   = load_config()
-        scale = ScaleManager.__new__(ScaleManager)
-        scale.cfg  = cfg
-        from scale_app import AcquisitionPipeline
-        scale._acq = AcquisitionPipeline.__new__(AcquisitionPipeline)
-        scale._acq._read_count = [0]*4
-        scale._acq._err_count  = [0]*4
-        scale._acq.n_cells     = 4
-        return jsonify(scale.get_diagnostics())
+        scale = _get_live_scale()
+        return jsonify(scale.diagnostics())
     except Exception as e:
         return jsonify({"error": str(e)})
 

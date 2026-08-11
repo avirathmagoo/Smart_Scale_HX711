@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Smart Scale
+Comment=Start the Smart Scale weighing + camera app
+Exec=lxterminal -e "python3 /home/melody/smartscale/launcher.py"
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Utility;
