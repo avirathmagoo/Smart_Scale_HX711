@@ -213,9 +213,9 @@ def _get_live_scale():
 def do_tare():
     try:
         scale = _get_live_scale()
-        ok = scale.combined_tare()
+        ok = scale.tare()
         flash("Tare complete — platform zeroed." if ok else
-              "Tare finished with errors — check scale.log.", "ok" if ok else "err")
+              "Tare failed — no data from ESP32 yet, check the UART link.", "ok" if ok else "err")
     except Exception as e:
         flash(f"Tare error: {e}", "err")
     return redirect(url_for("index") + "#calibration")

@@ -209,9 +209,10 @@
 
     <p class="section-label">Step 1 — Tare (Zero the scale)</p>
     <p style="color:#888;font-size:.82rem;margin-bottom:.7rem;">
-      Remove everything from the platform, then press Tare. This tares BOTH
-      the ESP32's own baseline and the Pi's calibration offset — same as the
-      on-screen TARE button and what happens automatically at startup.
+      Remove everything from the platform, then press Tare. This is a
+      Pi-side-only zero (the ESP32 just streams raw sensor data continuously
+      and is never asked to do anything) — same as the on-screen TARE button
+      and what happens automatically at startup.
     </p>
     <form method="POST" action="/tare">
       <button class="btn btn-orange" type="submit">Run Tare Now</button>
@@ -238,7 +239,7 @@
     <p class="section-label">Manual Calibration Values (Advanced)</p>
     <p style="color:#888;font-size:.82rem;margin-bottom:.7rem;">
       Edit raw offsets and factors directly. Offsets are in raw ESP32 counts
-      (post ESP32-side tare), factors convert raw counts to kg. Only change
+      (post Pi-side tare), factors convert raw counts to kg. Only change
       if you know what you're doing.
     </p>
     <form method="POST" action="/save_cal_manual">

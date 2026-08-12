@@ -1,5 +1,5 @@
 """
-Smart Scale — Main Application  (UART / ESP32 edition)
+Smart Scale — Main Application  (UART / ESP32 edition, v3)
 Raspberry Pi 4B | ESP32 (4x HX711 bridge, over UART) | USB Webcam | 1024x600
 
 ARCHITECTURE
@@ -9,15 +9,18 @@ ARCHITECTURE
   button      thread — GPIO17 hardware capture button (interrupt-driven)
   main        thread — pygame display + state machine + touch controls
 
-All load-cell hardware access (HX711 chips) now lives on the ESP32. The Pi
-only ever talks to the ESP32 over UART — see ESP32_Code.cpp for the packet
-format.
+The ESP32 ONLY reads sensors and streams raw data — it has no tare/command
+handling at all (v2 firmware). All tare and calibration math lives entirely
+on the Pi. This is a deliberate simplification: an earlier version sent a
+tare command to the ESP32, but the ESP32's tare routine paused its main
+loop long enough that the Pi saw it as a dead link. Removing that
+coordination entirely fixed both problems at once — see context.md §12.
 
 DISPLAY UNITS: everything shown to a person — screen, photos, web page — is
 in whole GRAMS, no decimals. Calibration math internally still works in kg
 (cal_factors are "raw counts per kg", same convention as before) purely
 because that's a convenient calibration-time unit; the moment a value is
-meant for a human it's converted to grams and rounded. See context.md §5.
+meant for a human it's converted to grams and rounded.
 """
 
 import cv2
@@ -58,7 +61,7 @@ DEFAULT_CONFIG = {
     "display_height":       600,
     "weight_strip_height":  50,
     "control_bar_height":   50,
-    "fullscreen":           False,   # windowed by default (see context.md §notes)
+    "fullscreen":           False,
     "trigger_weight_g":     500,     # grams — everything user-facing is grams
     "stabilise_seconds":    5.0,
     "cell_labels":          ["C1", "C2", "C3", "C4"],
@@ -104,7 +107,7 @@ def save_config(cfg):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UART READER — talks to the ESP32
+# UART READER — talks to the ESP32 (read-only stream, no commands sent)
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
     import serial
@@ -113,7 +116,9 @@ except ImportError:
     SERIAL_AVAILABLE = False
     log.warning("pyserial not available — simulation mode")
 
-RING_DEPTH   = 40     # raw samples kept per channel (~2s of data at 20Hz)
+RING_DEPTH   = 20     # raw samples kept per channel (ESP32 already averages
+                       # 4 samples on-device and sends at ~6.7Hz, so this is
+                       # ~3 seconds of already-smoothed data)
 LINK_TIMEOUT = 2.0    # seconds without a valid packet before "disconnected"
 
 _DATA_RE = re.compile(r"^D,(-?\d+),(-?\d+),(-?\d+),(-?\d+),([0-9A-Fa-f]{2})$")
@@ -123,8 +128,8 @@ class UARTReader:
     """
     Owns the serial connection to the ESP32.
     Background thread continuously reads lines, validates the checksum,
-    and appends good raw samples to per-channel ring buffers.
-    Also handles the tare handshake ('T' -> 'A,TARE_OK'/'A,TARE_FAIL').
+    and appends good raw samples to per-channel ring buffers. This is
+    READ-ONLY — the Pi never writes anything to the ESP32 in this version.
     """
 
     def __init__(self, port: str, baud: int):
@@ -137,8 +142,6 @@ class UARTReader:
         self._invalid_count = 0
         self._stop = threading.Event()
         self._ser = None
-        self._tare_result = threading.Event()
-        self._tare_ok = False
 
         if SERIAL_AVAILABLE:
             try:
@@ -162,11 +165,11 @@ class UARTReader:
                 # without hardware attached.
                 import random
                 for i in range(4):
-                    sim_base[i] += random.randint(-200, 200)
+                    sim_base[i] += random.randint(-50, 50)
                     with self._ring_lock:
                         self._ring[i].append(sim_base[i])
                 self._last_packet_time = time.time()
-                time.sleep(0.05)
+                time.sleep(0.15)
                 continue
 
             try:
@@ -181,8 +184,8 @@ class UARTReader:
 
             if line.startswith("D,"):
                 self._handle_data_line(line)
-            elif line.startswith("A,"):
-                self._handle_ack_line(line)
+            elif line.startswith("A,READY"):
+                log.info("ESP32 reported READY")
             # Anything else (boot banner noise, partial lines) is ignored.
 
     def _handle_data_line(self, line: str):
@@ -208,16 +211,6 @@ class UARTReader:
             for i in range(4):
                 self._ring[i].append(vals[i])
 
-    def _handle_ack_line(self, line: str):
-        if line == "A,TARE_OK":
-            self._tare_ok = True
-            self._tare_result.set()
-        elif line == "A,TARE_FAIL":
-            self._tare_ok = False
-            self._tare_result.set()
-        elif line == "A,READY":
-            log.info("ESP32 reported READY")
-
     # ── Public API ─────────────────────────────────────────────────────────
     def get_snapshot(self):
         with self._ring_lock:
@@ -226,24 +219,6 @@ class UARTReader:
     @property
     def connected(self) -> bool:
         return (time.time() - self._last_packet_time) < LINK_TIMEOUT
-
-    def send_tare(self, timeout: float = 5.0) -> bool:
-        """Send 'T' to the ESP32 and wait for the ack. Returns True on TARE_OK,
-        False on TARE_FAIL or timeout (no hardware / not connected)."""
-        if self._ser is None:
-            log.warning("Tare: no UART connection — skipping ESP32-side tare")
-            return False
-        self._tare_result.clear()
-        try:
-            self._ser.write(b"T\n")
-        except Exception as e:
-            log.error(f"Tare: UART write failed: {e}")
-            return False
-        got = self._tare_result.wait(timeout)
-        if not got:
-            log.warning("Tare: no ack from ESP32 within timeout")
-            return False
-        return self._tare_ok
 
     def stats(self):
         return {
@@ -264,19 +239,18 @@ class UARTReader:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CALIBRATION / FILTER PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
-# Tuned for a stable, low-jitter GRAM readout rather than raw responsiveness:
-#   - a wide trimmed-mean window absorbs single-sample HX711 noise
-#   - a slow EMA smooths the remaining wobble
-#   - a small display hysteresis (only move the shown number if it changes by
-#     >= HYSTERESIS_G) stops the last digit from flickering when the true
-#     weight is sitting right on a rounding boundary
-# This trades a little responsiveness for a number that's actually readable —
-# raise/lower these if your load cells + platform need different tuning.
+# The ESP32 now sends already-averaged (4-sample) raw readings at ~6.7Hz, so
+# the Pi doesn't need to do as much heavy lifting as before — these settings
+# are lighter/faster than earlier drafts on purpose, since over-filtering
+# clean data just adds lag without adding accuracy. If readings still feel
+# jittery on your hardware, widen FILTER_WINDOW or lower EMA_ALPHA; if they
+# feel sluggish, do the opposite. HYSTERESIS_G is what actually stops the
+# last digit from flickering — that one rarely needs changing.
 
-FILTER_WINDOW  = 30    # raw samples used per filtered output (~1.5s @ 20Hz)
-EMA_ALPHA       = 0.06 # display smoothing (lower = smoother, slower to settle)
+FILTER_WINDOW  = 12    # raw samples used per filtered output (~2.5s @ ESP32's rate)
+EMA_ALPHA       = 0.15 # display smoothing (lower = smoother, slower to settle)
 STABLE_THRESH_G = 3     # grams — mean must stay within this to be "stable"
-STABLE_COUNT    = 10    # consecutive stable readings needed
+STABLE_COUNT    = 8     # consecutive stable readings needed
 HYSTERESIS_G    = 2     # grams — minimum change before the shown number moves
 
 
@@ -291,10 +265,10 @@ def _trimmed_mean(samples):
 class ScaleManager:
     """
     Owns a UARTReader and a processing thread that filters + calibrates
-    the raw stream into GRAM values (all outward-facing state is grams —
-    see module docstring). tare()/calibrate() read directly from the
-    current ring-buffer snapshot — no pausing needed, since the UARTReader
-    thread is an independent producer.
+    the raw stream into GRAM values. tare()/calibrate() read directly from
+    the current ring-buffer snapshot — no pausing needed, since the
+    UARTReader thread is an independent producer. Tare is PI-SIDE ONLY;
+    the ESP32 is never asked to do anything — it just streams.
     """
 
     def __init__(self, cfg: dict):
@@ -333,7 +307,7 @@ class ScaleManager:
 
     def _proc_loop(self):
         while not self._stop.is_set():
-            time.sleep(0.08)  # ~12 Hz
+            time.sleep(0.1)
 
             snap = self.uart.get_snapshot()
             link_ok = self.uart.connected
@@ -344,7 +318,7 @@ class ScaleManager:
             for i in range(4):
                 buf = snap[i]
 
-                if not link_ok or len(buf) < 4:
+                if not link_ok or len(buf) < 3:
                     g_vals.append(self._ema_g[i])
                     diags.append("no_data")
                     continue
@@ -403,8 +377,8 @@ class ScaleManager:
             return dict(self._out)
 
     def tare(self) -> bool:
-        """Pi-side tare: zero the current filtered raw baseline. Call
-        combined_tare() instead if you also want the ESP32 zeroed first."""
+        """Pi-side tare — the only kind of tare in this version. Zeros the
+        current filtered raw baseline. Nothing is sent to the ESP32."""
         snap = self.uart.get_snapshot()
         new_offsets = []
         ok = True
@@ -424,19 +398,8 @@ class ScaleManager:
                 self._ema_g, self._ema_mean_g, self._prev_ema = [0.0]*4, 0.0, 0.0
                 self._stable_ctr = 0
                 self._disp_g, self._disp_mean_g = [0]*4, 0
-            log.info(f"Pi-side tare done — offsets: {[round(o) for o in new_offsets]}")
+            log.info(f"Tare done — offsets: {[round(o) for o in new_offsets]}")
         return ok
-
-    def combined_tare(self) -> bool:
-        """Full tare: ESP32 zeroes its own baseline first, then the Pi
-        zeroes whatever the (now-fresh) stream reads as."""
-        esp_ok = self.uart.send_tare()
-        if esp_ok:
-            log.info("ESP32-side tare OK")
-        else:
-            log.warning("ESP32-side tare failed or unavailable — continuing with Pi-side tare only")
-        time.sleep(0.3)  # let a few post-tare packets arrive
-        return self.tare()
 
     def calibrate(self, known_kg: float) -> bool:
         if known_kg <= 0:
@@ -721,14 +684,22 @@ def _find_usb_partition():
     return None
 
 
+def _clean_udisks_path(raw: str) -> str:
+    """udisksctl wraps paths in old-style Unix quoting on some message
+    types — e.g. an "already mounted" error prints `/media/x/Y'. (backtick
+    ... apostrophe-period), while a fresh "Mounted at" message doesn't.
+    Strip any of that decorative punctuation so both forms parse the same."""
+    return raw.strip("`'\".,")
+
+
 def _udisks_mount(devpath: str):
     try:
         r = subprocess.run(["udisksctl", "mount", "-b", devpath],
                             capture_output=True, text=True, timeout=15)
         combined = (r.stdout or "") + (r.stderr or "")
-        m = re.search(r"at (\S+)", combined)
+        m = re.search(r"at\s+(\S+)", combined)
         if m:
-            return m.group(1).rstrip(".")
+            return _clean_udisks_path(m.group(1))
         return None
     except Exception as e:
         log.error(f"USB export: mount failed: {e}")
@@ -746,7 +717,11 @@ def _udisks_unmount(devpath: str):
 def export_photos_to_usb(status_cb):
     """Zips PHOTOS_DIR and copies the zip to a plugged-in USB drive.
     status_cb(text) is called with short progress strings the caller can
-    show on screen. Never deletes anything from the Pi."""
+    show on screen. Never deletes anything from the Pi.
+
+    Requires passwordless udisks2 mount for the current user — see the
+    polkit rule in SETUP.md (Part 6). Without it, mounting will hang
+    waiting for a password prompt no one can answer from the touchscreen."""
     status_cb("Looking for USB drive...")
     dev = _find_usb_partition()
     if not dev:
@@ -756,7 +731,7 @@ def export_photos_to_usb(status_cb):
     status_cb("Mounting drive...")
     mount_point = _udisks_mount(dev)
     if not mount_point:
-        status_cb("Mount failed")
+        status_cb("Mount failed (check polkit rule — see SETUP.md)")
         return False
 
     try:
@@ -917,13 +892,13 @@ def main():
     global _scale_manager
     cfg = load_config()
 
-    # ── Scale: start acquisition, then combined tare (ESP32 + Pi) ──────────
+    # ── Scale: start acquisition, then Pi-side tare (nothing sent to ESP32) ─
     scale = ScaleManager(cfg)
     _scale_manager = scale
     scale.start()
-    log.info("Startup tare — platform must be EMPTY. Waiting 3s for UART link...")
-    time.sleep(3)
-    scale.combined_tare()
+    log.info("Startup tare — platform must be EMPTY. Waiting 2s for UART data...")
+    time.sleep(2)
+    scale.tare()
 
     # ── Hardware capture button ─────────────────────────────────────────────
     button = CaptureButton(cfg["button_gpio"])
@@ -963,7 +938,7 @@ def main():
     remaining     = 0.0
     cfg_mtime     = 0.0
 
-    busy_name       = None    # "capture" / "export" while a background job runs
+    busy_name       = None    # "capture" / "export" / "tare" while a background job runs
     status_text     = ""
     status_until    = 0.0
     shutdown_armed_until = 0.0
@@ -991,9 +966,8 @@ def main():
     def do_tare():
         nonlocal busy_name
         busy_name = "tare"
-        set_status("Taring...", 30)
-        ok = scale.combined_tare()
-        set_status("Tare complete" if ok else "Tare finished with errors")
+        ok = scale.tare()
+        set_status("Tare complete" if ok else "Tare failed — no data from ESP32 yet")
         busy_name = None
 
     def do_export():

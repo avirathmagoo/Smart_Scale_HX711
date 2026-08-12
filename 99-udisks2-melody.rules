@@ -1,0 +1,22 @@
+// Smart Scale — passwordless USB drive mount/unmount for the Export button
+//
+// Without this, udisksctl falls back to an interactive polkit auth prompt
+// under some session conditions, which the touchscreen app has no way to
+// answer — it just hangs until it times out (visible as "Mount failed" or
+// a long stall in scale.log).
+//
+// Install:
+//   sudo cp 99-udisks2-melody.rules /etc/polkit-1/rules.d/
+//   sudo systemctl restart polkit
+//
+// This grants ONLY melody, ONLY for mounting/unmounting removable
+// filesystems (not full disk/system control) — narrowly scoped on purpose.
+
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.udisks2.filesystem-mount" ||
+         action.id == "org.freedesktop.udisks2.filesystem-mount-other-seat" ||
+         action.id == "org.freedesktop.udisks2.filesystem-unmount-others") &&
+        subject.user == "melody") {
+        return polkit.Result.YES;
+    }
+});

@@ -208,9 +208,13 @@ pip3 install --break-system-packages pygame
    `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
 3. Tools → Board → Boards Manager → search "esp32" → install the Espressif package.
 4. Tools → Board → select **AI Thinker ESP32-CAM**.
-
-No extra libraries are required — `ESP32_Code.cpp` uses only the built-in
-Arduino core (the HX711 bit-bang is implemented directly in the file).
+5. Tools → Manage Libraries → search **"HX711"** → install the one by
+   **Bogdan Necula** (sometimes listed as "HX711 by Bogdan Necula / Andreas
+   Motl"). This firmware uses that library's read functions directly rather
+   than a hand-rolled bit-bang implementation — an earlier draft of this
+   firmware used a custom implementation and produced occasional wild,
+   wrong readings; the library is the same well-tested code your original
+   working ESP32 sketch used.
 
 ### 3.2 Flashing connection (temporary, USB-TTL adapter — NOT the Pi)
 
@@ -238,7 +242,18 @@ RX             ──►  GPIO 1 (U0TXD)
    D,123,-45,67,890,3C
    D,...
    ```
-   (raw numbers will vary — this confirms all 4 HX711 channels are being read).
+   (raw numbers will vary — this confirms all 4 HX711 channels are being
+   read). A new line should appear roughly every 150ms. With the platform
+   empty and stationary, watch the numbers for a few seconds — they should
+   drift only slightly, never jump wildly. If any channel jumps by huge
+   amounts (thousands+) randomly, that's a wiring/connection problem on
+   that specific HX711, not a Pi-side issue — check its DOUT/SCK/VCC/GND
+   connections before moving on.
+
+> **Note:** this firmware has no tare command and accepts nothing from the
+> Pi at all — it only ever sends data. There's nothing to test from the Pi
+> side of the link except confirming data arrives; all tare/calibration
+> testing happens on the Pi (Part 9).
 
 ### 3.3 Switch to the Pi link
 
@@ -371,10 +386,29 @@ Verify the file is valid:
 sudo visudo -c
 ```
 
-> Note: USB drive mount/unmount for the Export button uses `udisksctl`,
-> which is authorized via polkit for the active desktop session — it does
-> NOT need a sudoers entry. If exports fail with a permissions/auth error,
-> see Troubleshooting below.
+### 6.1 Passwordless USB mounting (required for the Export button)
+
+Relying on polkit's "active session" detection for password-free
+`udisksctl` mounting turned out to be unreliable in practice (it can prompt
+for a password depending on exactly how the session was started). A
+polkit rule fixes this explicitly instead:
+
+```bash
+sudo cp /home/melody/smartscale/99-udisks2-melody.rules /etc/polkit-1/rules.d/
+sudo systemctl restart polkit
+```
+
+Test it directly (no app needed) — plug in a USB drive, find its device
+name, then:
+
+```bash
+lsblk -o NAME,TRAN,FSTYPE
+udisksctl mount -b /dev/sda1     # use the actual partition name from lsblk
+```
+
+This should mount immediately with no password prompt. If it still asks
+for a password, double-check the rule file copied correctly and that
+polkit actually restarted (`sudo systemctl status polkit`).
 
 ---
 
@@ -494,12 +528,12 @@ Do this once the hardware is wired and the app is running.
 
 ### Step 1 — Tare
 1. Make sure the scale platform is completely empty.
-2. Either wait for the automatic startup tare (happens ~3 seconds after the
+2. Either wait for the automatic startup tare (happens ~2 seconds after the
    app launches), or open the web UI → **Calibration** → **Run Tare Now**,
    or tap **TARE** on the touchscreen.
-3. This tares BOTH sides: the ESP32 zeroes its own raw baseline first, then
-   the Pi zeroes whatever the (now fresh) stream reads as. You'll see
-   "Tare complete" once both steps finish.
+3. This is Pi-side only — the ESP32 never does anything but stream raw
+   data, so there's nothing to wait on for an ESP32 acknowledgement. Tare
+   should complete in under a second.
 
 ### Step 2 — Calibrate
 1. Place a known reference weight on the platform (e.g. a 1kg object whose
@@ -590,15 +624,17 @@ df -h /
 | Problem | Check / Fix |
 |---|---|
 | Web UI not reachable | `sudo systemctl status smartscale` — check for errors. Verify IP: `ip addr show wlan0` |
+| **Login page shows "Internal Server Error" / `TemplateNotFound: login.html`** | The template file is missing on disk, not a code bug. Run `ls -la /home/melody/smartscale/templates/` — you need to see BOTH `login.html` and `index.html` there. If missing, re-copy/re-pull; check your git repo actually committed the `templates/` folder (a common gotcha: only the root `.py` files get added and the templates subfolder is forgotten) |
 | Camera feed black / not opening | `ls /dev/video*` — if missing, replug webcam. Try `camera_index: 1` in config |
-| "ESP32 LINK LOST" on the weight strip | Check the ESP32 is powered and the GPIO14/15↔GPIO1/3 wiring is correct (TX↔RX crossed, not straight-through). Check `/dev/serial0` exists. Check the serial console was disabled (Part 1.3) — if it's still enabled, the OS is fighting the ESP32 for the port |
+| "ESP32 LINK LOST" on the weight strip | Check the ESP32 is powered and the GPIO14/15↔GPIO1/3 wiring is correct (TX↔RX crossed, not straight-through). Check `/dev/serial0` exists. Check the serial console was disabled (Part 1.3). This firmware never pauses its own loop (no tare command anymore), so a link that drops after being fine for a while points to a wiring/power issue, not a firmware stall |
 | All weight readings are 0 or `no_data` | Check HX711↔ESP32 wiring first (not Pi wiring — that's gone now). Reflash the ESP32 and watch its Serial Monitor for `D,...` lines before wiring it to the Pi |
+| Weight readings jump wildly / look like random noise, not just "a bit jittery" | Confirm you're running the current firmware (uses the `HX711` library, not a hand-rolled bit-bang) and that the HX711 library is actually installed (Part 3.1). Watch the ESP32's own Serial Monitor directly — if raw numbers are already wild there with an empty, stationary platform, it's a wiring/power/ground issue on that HX711 module, not something fixable in software |
 | Readings drift after tare | Normal if the platform vibrates. Re-tare on a stable surface |
-| Tare button says "Pi-side only" | The ESP32 didn't ack the tare command — check the UART link, then retry |
 | Photos not appearing in gallery | Check `ls /home/melody/smartscale/photos/` — verify write permissions |
 | Storage cap seems to be deleting photos too aggressively | Raise `photos_max_mb` in the web UI's Storage section |
 | Export USB says "No USB drive found" | `lsblk -o NAME,TRAN` — confirm the drive shows `TRAN=usb`. Try a different USB port or drive |
-| Export USB says "Mount failed" | Run `udisksctl mount -b /dev/sdX1` manually over SSH to see the real error. If it's an auth/polkit error, confirm `policykit-1` is installed and that `smartscale.service` runs under an active graphical session (Part 8) |
+| Export USB asks for a password / hangs on mount | You're missing the polkit rule — see Part 6.1. This is required, not optional; without it, mounting can silently wait for a password prompt nothing on the touchscreen can answer |
+| Export USB says "Mount failed" (after installing the polkit rule) | Run `udisksctl mount -b /dev/sdX1` manually over SSH to see the real error |
 | Service fails to start | `journalctl -u smartscale -n 30` to see the actual error |
 | Static IP not working | Verify your router gateway — it may be `192.168.0.1` not `192.168.1.1`. Edit `/etc/dhcpcd.conf` |
 | WiFi fallback not connecting | Run `wpa_cli -i wlan0 reconfigure` manually and check `wpa_cli status` |
@@ -625,6 +661,7 @@ df -h /
 | Static IP config | `/etc/dhcpcd.conf` |
 | WiFi networks | `/etc/wpa_supplicant/wpa_supplicant.conf` |
 | Sudoers rule | `/etc/sudoers.d/smartscale` |
+| Polkit rule (passwordless USB mount) | `/etc/polkit-1/rules.d/99-udisks2-melody.rules` |
 
 ## GPIO / PIN SUMMARY
 
