@@ -4,15 +4,20 @@ Raspberry Pi 4B | ESP32 (4x HX711 bridge, over UART) | USB Webcam | 1024x600
 
 ARCHITECTURE
   uart-reader thread — reads ESP32 packets, validates checksum, fills ring buffers
-  hx711-proc  thread — filtering + calibration (Pi-side), publishes kg values
+  hx711-proc  thread — filtering + calibration (Pi-side), publishes gram values
   camera      thread — frame grab (lowest priority)
   button      thread — GPIO17 hardware capture button (interrupt-driven)
   main        thread — pygame display + state machine + touch controls
 
 All load-cell hardware access (HX711 chips) now lives on the ESP32. The Pi
 only ever talks to the ESP32 over UART — see ESP32_Code.cpp for the packet
-format. Calibration/tare math is unchanged from the original GPIO version;
-only the data SOURCE changed.
+format.
+
+DISPLAY UNITS: everything shown to a person — screen, photos, web page — is
+in whole GRAMS, no decimals. Calibration math internally still works in kg
+(cal_factors are "raw counts per kg", same convention as before) purely
+because that's a convenient calibration-time unit; the moment a value is
+meant for a human it's converted to grams and rounded. See context.md §5.
 """
 
 import cv2
@@ -53,16 +58,17 @@ DEFAULT_CONFIG = {
     "display_height":       600,
     "weight_strip_height":  50,
     "control_bar_height":   50,
-    "trigger_weight_kg":    0.5,
+    "fullscreen":           False,   # windowed by default (see context.md §notes)
+    "trigger_weight_g":     500,     # grams — everything user-facing is grams
     "stabilise_seconds":    5.0,
-    "unit":                 "kg",
     "cell_labels":          ["C1", "C2", "C3", "C4"],
-    # UART link to the ESP32 (replaces clk_pin/dout_pins)
+    # UART link to the ESP32
     "uart_port":             "/dev/serial0",
     "uart_baud":             115200,
     # Hardware capture button
     "button_gpio":           17,
-    # Calibration (unchanged meaning: raw counts in, kg out)
+    # Calibration — internally raw-counts-per-KG (calibration-time convenience
+    # unit only); every consumer of ScaleManager output sees grams.
     "offsets":              [0, 0, 0, 0],
     "cal_factors":          [1.0, 1.0, 1.0, 1.0],
     # Camera
@@ -107,7 +113,7 @@ except ImportError:
     SERIAL_AVAILABLE = False
     log.warning("pyserial not available — simulation mode")
 
-RING_DEPTH   = 24     # raw samples kept per channel
+RING_DEPTH   = 40     # raw samples kept per channel (~2s of data at 20Hz)
 LINK_TIMEOUT = 2.0    # seconds without a valid packet before "disconnected"
 
 _DATA_RE = re.compile(r"^D,(-?\d+),(-?\d+),(-?\d+),(-?\d+),([0-9A-Fa-f]{2})$")
@@ -256,13 +262,22 @@ class UARTReader:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CALIBRATION / FILTER PIPELINE  (unchanged math from the original GPIO version)
+# CALIBRATION / FILTER PIPELINE
 # ═══════════════════════════════════════════════════════════════════════════════
+# Tuned for a stable, low-jitter GRAM readout rather than raw responsiveness:
+#   - a wide trimmed-mean window absorbs single-sample HX711 noise
+#   - a slow EMA smooths the remaining wobble
+#   - a small display hysteresis (only move the shown number if it changes by
+#     >= HYSTERESIS_G) stops the last digit from flickering when the true
+#     weight is sitting right on a rounding boundary
+# This trades a little responsiveness for a number that's actually readable —
+# raise/lower these if your load cells + platform need different tuning.
 
-FILTER_WINDOW = 16    # samples used per filtered output
-EMA_ALPHA     = 0.12  # display smoothing (lower = smoother)
-STABLE_THRESH = 0.008 # kg — reading must stay within this to be "stable"
-STABLE_COUNT  = 10    # consecutive stable readings needed
+FILTER_WINDOW  = 30    # raw samples used per filtered output (~1.5s @ 20Hz)
+EMA_ALPHA       = 0.06 # display smoothing (lower = smoother, slower to settle)
+STABLE_THRESH_G = 3     # grams — mean must stay within this to be "stable"
+STABLE_COUNT    = 10    # consecutive stable readings needed
+HYSTERESIS_G    = 2     # grams — minimum change before the shown number moves
 
 
 def _trimmed_mean(samples):
@@ -276,31 +291,35 @@ def _trimmed_mean(samples):
 class ScaleManager:
     """
     Owns a UARTReader and a processing thread that filters + calibrates
-    the raw stream into kg values. tare()/calibrate() read directly from
-    the current ring-buffer snapshot — no pausing needed, since the
-    UARTReader thread is an independent producer.
+    the raw stream into GRAM values (all outward-facing state is grams —
+    see module docstring). tare()/calibrate() read directly from the
+    current ring-buffer snapshot — no pausing needed, since the UARTReader
+    thread is an independent producer.
     """
 
     def __init__(self, cfg: dict):
         self.cfg   = cfg
         self.uart  = UARTReader(cfg["uart_port"], cfg["uart_baud"])
-        self._n    = 4
 
         self._out_lock = threading.Lock()
         self._out = {
-            "kg":       [0.0] * 4,
-            "ema_kg":   [0.0] * 4,
-            "mean_kg":  0.0,
-            "ema_mean": 0.0,
-            "stable":   False,
-            "diag":     ["no_data"] * 4,
-            "uart_ok":  False,
+            "g":            [0.0] * 4,   # instantaneous filtered grams (float)
+            "ema_g":        [0.0] * 4,   # smoothed grams (float)
+            "disp_g":       [0] * 4,     # hysteresis-held integer grams (for display)
+            "mean_g":       0.0,
+            "ema_mean_g":   0.0,
+            "disp_mean_g":  0,
+            "stable":       False,
+            "diag":         ["no_data"] * 4,
+            "uart_ok":      False,
         }
 
-        self._ema_ch      = [0.0] * 4
-        self._ema_mean     = 0.0
-        self._prev_ema      = 0.0
-        self._stable_ctr    = 0
+        self._ema_g       = [0.0] * 4
+        self._ema_mean_g  = 0.0
+        self._prev_ema     = 0.0
+        self._stable_ctr   = 0
+        self._disp_g       = [0] * 4
+        self._disp_mean_g  = 0
 
         self._stop = threading.Event()
 
@@ -319,59 +338,64 @@ class ScaleManager:
             snap = self.uart.get_snapshot()
             link_ok = self.uart.connected
 
-            kg_vals = []
-            diags   = []
+            g_vals = []
+            diags  = []
 
             for i in range(4):
                 buf = snap[i]
 
                 if not link_ok or len(buf) < 4:
-                    kg_vals.append(self._ema_ch[i])
+                    g_vals.append(self._ema_g[i])
                     diags.append("no_data")
                     continue
 
-                window = buf[-FILTER_WINDOW:]
-
-                try:
-                    std = statistics.stdev(window)
-                except Exception:
-                    std = 0
-                if std > 80_000:
-                    kg_vals.append(self._ema_ch[i])
-                    diags.append("noisy")
-                    continue
-
-                raw_avg = _trimmed_mean(window)
+                window   = buf[-FILTER_WINDOW:]
+                raw_avg  = _trimmed_mean(window)
 
                 offset = self.cfg["offsets"][i]
                 factor = self.cfg["cal_factors"][i]
                 factor = factor if abs(factor) >= 1 else 1.0
                 kg     = (raw_avg - offset) / factor
+                grams  = kg * 1000.0
 
-                kg_vals.append(kg)
+                g_vals.append(grams)
                 diags.append("ok")
 
-            mean_kg = sum(kg_vals) / len(kg_vals)
+            mean_g = sum(g_vals) / len(g_vals)
 
             a = EMA_ALPHA
-            ema_ch = [a * kg_vals[i] + (1 - a) * self._ema_ch[i] for i in range(4)]
-            ema_mean = a * mean_kg + (1 - a) * self._ema_mean
+            ema_g    = [a * g_vals[i] + (1 - a) * self._ema_g[i] for i in range(4)]
+            ema_mean = a * mean_g + (1 - a) * self._ema_mean_g
 
-            if abs(ema_mean - self._prev_ema) < STABLE_THRESH:
+            if abs(ema_mean - self._prev_ema) < STABLE_THRESH_G:
                 self._stable_ctr = min(self._stable_ctr + 1, STABLE_COUNT + 1)
             else:
                 self._stable_ctr = 0
             stable = self._stable_ctr >= STABLE_COUNT
 
-            self._ema_ch   = ema_ch
-            self._ema_mean = ema_mean
-            self._prev_ema = ema_mean
+            # Display hysteresis — only move the shown integer if the
+            # smoothed value has actually moved past the threshold.
+            disp_g = list(self._disp_g)
+            for i in range(4):
+                rounded = round(ema_g[i])
+                if abs(rounded - disp_g[i]) >= HYSTERESIS_G:
+                    disp_g[i] = rounded
+            disp_mean_g = self._disp_mean_g
+            rounded_mean = round(ema_mean)
+            if abs(rounded_mean - disp_mean_g) >= HYSTERESIS_G:
+                disp_mean_g = rounded_mean
+
+            self._ema_g       = ema_g
+            self._ema_mean_g  = ema_mean
+            self._prev_ema     = ema_mean
+            self._disp_g       = disp_g
+            self._disp_mean_g  = disp_mean_g
 
             with self._out_lock:
                 self._out = {
-                    "kg": kg_vals, "ema_kg": ema_ch, "mean_kg": mean_kg,
-                    "ema_mean": ema_mean, "stable": stable, "diag": diags,
-                    "uart_ok": link_ok,
+                    "g": g_vals, "ema_g": ema_g, "disp_g": disp_g,
+                    "mean_g": mean_g, "ema_mean_g": ema_mean, "disp_mean_g": disp_mean_g,
+                    "stable": stable, "diag": diags, "uart_ok": link_ok,
                 }
 
     def get_values(self) -> dict:
@@ -397,8 +421,9 @@ class ScaleManager:
             self.cfg["offsets"] = new_offsets
             save_config(self.cfg)
             with self._out_lock:
-                self._ema_ch, self._ema_mean, self._prev_ema = [0.0]*4, 0.0, 0.0
+                self._ema_g, self._ema_mean_g, self._prev_ema = [0.0]*4, 0.0, 0.0
                 self._stable_ctr = 0
+                self._disp_g, self._disp_mean_g = [0]*4, 0
             log.info(f"Pi-side tare done — offsets: {[round(o) for o in new_offsets]}")
         return ok
 
@@ -466,11 +491,11 @@ class ScaleManager:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SHARED STATE for Flask
+# SHARED STATE for Flask  (grams throughout)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _shared = {
-    "weights": [0.0]*4, "mean": 0.0,
+    "weights_g": [0]*4, "mean_g": 0,
     "status": "idle", "countdown": 0,
     "last_photo": "", "stable": False,
     "diag": ["no_data"]*4, "uart_ok": False,
@@ -522,7 +547,10 @@ class CaptureButton:
                 self._enabled = True
                 log.info(f"Capture button armed on GPIO{pin}")
             except Exception as e:
-                log.error(f"Capture button setup failed on GPIO{pin}: {e}")
+                log.error(f"Capture button setup failed on GPIO{pin}: {e} — "
+                          f"hardware button disabled, on-screen button still works. "
+                          f"See context.md troubleshooting if this persists "
+                          f"(often a gpio-group or RPi.GPIO/kernel compatibility issue).")
 
     def _on_press(self, channel):
         self.event.set()
@@ -543,7 +571,7 @@ class CaptureButton:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CAMERA  (unchanged)
+# CAMERA
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Camera:
@@ -620,7 +648,7 @@ class Camera:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PHOTO SAVE + STORAGE CAP
+# PHOTO SAVE + STORAGE CAP  (grams, no decimals, in the caption)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def save_photo(frame, vals, labels, strip_h) -> str:
@@ -631,10 +659,10 @@ def save_photo(frame, vals, labels, strip_h) -> str:
     cv2.rectangle(photo, (0, strip_y), (w, h), (22, 22, 22), -1)
     cv2.line(photo, (0, strip_y), (w, strip_y), (65, 65, 65), 1)
 
-    ema  = vals["ema_kg"]
-    mean = vals["ema_mean"]
-    parts = [f"{labels[i]}: {ema[i]:.3f}kg" for i in range(4)]
-    parts.append(f"MEAN: {mean:.3f}kg")
+    disp_g = vals["disp_g"]
+    mean_g = vals["disp_mean_g"]
+    parts = [f"{labels[i]}: {disp_g[i]}g" for i in range(4)]
+    parts.append(f"MEAN: {mean_g}g")
     cv2.putText(photo, "   |   ".join(parts),
                 (10, strip_y + strip_h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.58,
@@ -774,6 +802,7 @@ COL_STRIP  = (22,  22,  22 )
 COL_LINE   = (65,  65,  65 )
 COL_BTN    = (45,  45,  45 )
 COL_BTN_ON = (35,  110, 35 )
+COL_BTN_WARN   = (110, 40, 40)
 COL_BTN_BORDER = (90, 90, 90)
 
 def make_fonts():
@@ -783,23 +812,37 @@ def make_fonts():
         "large":  pygame.font.SysFont("monospace", 68, bold=True),
     }
 
-def frame_to_surface(frame, w, h):
+def blit_camera_frame(screen, frame, area: pygame.Rect):
+    """Draws the camera frame INSIDE `area`, preserving its aspect ratio
+    (letterboxed with black bars if the frame's aspect doesn't match the
+    area's) instead of stretching it to fill a mismatched rectangle."""
+    fh, fw = frame.shape[:2]
+    if fw == 0 or fh == 0:
+        return
+
+    scale = min(area.w / fw, area.h / fh)
+    draw_w, draw_h = int(fw * scale), int(fh * scale)
+    off_x = area.x + (area.w - draw_w) // 2
+    off_y = area.y + (area.h - draw_h) // 2
+
+    pygame.draw.rect(screen, COL_BLACK, area)  # letterbox background
+
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    if frame.shape[1] != w or frame.shape[0] != h:
-        rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
-    return pygame.image.frombuffer(rgb.tobytes(), (w, h), "RGB")
+    rgb = cv2.resize(rgb, (draw_w, draw_h), interpolation=cv2.INTER_LINEAR)
+    surf = pygame.image.frombuffer(rgb.tobytes(), (draw_w, draw_h), "RGB")
+    screen.blit(surf, (off_x, off_y))
 
 def draw_strip(screen, fonts, vals, labels, strip_y, dw, sh):
     pygame.draw.rect(screen, COL_STRIP, (0, strip_y, dw, sh))
     pygame.draw.line(screen, COL_LINE,  (0, strip_y), (dw, strip_y), 1)
 
-    ema  = vals["ema_kg"]
-    mean = vals["ema_mean"]
-    stbl = vals["stable"]
+    disp_g = vals["disp_g"]
+    mean_g = vals["disp_mean_g"]
+    stbl   = vals["stable"]
     uart_ok = vals.get("uart_ok", True)
 
-    parts = [f"{labels[i]}: {ema[i]:.3f}kg" for i in range(4)]
-    mean_txt = f"MEAN: {mean:.3f}kg" + (" \u2713" if stbl else "")
+    parts = [f"{labels[i]}: {disp_g[i]}g" for i in range(4)]
+    mean_txt = f"MEAN: {mean_g}g" + (" \u2713" if stbl else "")
     text = "   |   ".join(parts) + "   |   " + mean_txt
     if not uart_ok:
         text = "ESP32 LINK LOST — " + text
@@ -810,39 +853,41 @@ def draw_strip(screen, fonts, vals, labels, strip_y, dw, sh):
     ty   = strip_y + (sh - surf.get_height()) // 2
     screen.blit(surf, (tx, ty))
 
-def draw_countdown(screen, fonts, secs, dw, dh):
+def draw_countdown(screen, fonts, secs, area: pygame.Rect):
     txt    = f"Photo in {secs:.1f}s"
     shadow = fonts["large"].render(txt, True, COL_BLACK)
     surf   = fonts["large"].render(txt, True, COL_YELLOW)
-    cx = (dw - surf.get_width())  // 2
-    cy = (dh - surf.get_height()) // 2
+    cx = area.x + (area.w - surf.get_width())  // 2
+    cy = area.y + (area.h - surf.get_height()) // 2
     screen.blit(shadow, (cx+2, cy+2))
     screen.blit(surf,   (cx,   cy  ))
 
-def draw_msg(screen, fonts, text, color, y=10):
+def draw_msg(screen, fonts, text, color, x, y):
     surf = fonts["medium"].render(text, True, color)
-    screen.blit(surf, (10, y))
+    screen.blit(surf, (x, y))
 
 
-# ── Control bar (top strip): TARE | CAPTURE | AUTO [slider] | EXPORT USB ────
+# ── Control bar (top strip): TARE | CAPTURE | AUTO [slider] | EXPORT | QUIT | SHUTDOWN
+BUTTON_ORDER = ("tare", "capture", "auto", "export", "quit", "shutdown")
+
 def make_control_rects(dw, bar_h):
-    margin = 8
-    n = 4
+    margin = 6
+    n = len(BUTTON_ORDER)
     w = (dw - margin * (n + 1)) // n
     rects = {}
     x = margin
-    for name in ("tare", "capture", "auto", "export"):
+    for name in BUTTON_ORDER:
         rects[name] = pygame.Rect(x, 4, w, bar_h - 8)
         x += w + margin
     return rects
 
 def draw_control_bar(screen, fonts, rects, dw, bar_h, autocapture_on,
-                      busy_name, status_text):
+                      busy_name, status_text, shutdown_armed):
     pygame.draw.rect(screen, COL_STRIP, (0, 0, dw, bar_h))
     pygame.draw.line(screen, COL_LINE, (0, bar_h), (dw, bar_h), 1)
 
-    def draw_btn(rect, label, on=False, busy=False):
-        color = COL_BTN_ON if on else COL_BTN
+    def draw_btn(rect, label, on=False, busy=False, warn=False):
+        color = COL_BTN_WARN if warn else (COL_BTN_ON if on else COL_BTN)
         pygame.draw.rect(screen, color, rect, border_radius=6)
         pygame.draw.rect(screen, COL_BTN_BORDER, rect, 1, border_radius=6)
         txt = "..." if busy else label
@@ -850,16 +895,18 @@ def draw_control_bar(screen, fonts, rects, dw, bar_h, autocapture_on,
         screen.blit(surf, (rect.x + (rect.w - surf.get_width()) // 2,
                             rect.y + (rect.h - surf.get_height()) // 2))
 
-    draw_btn(rects["tare"],    "TARE")
-    draw_btn(rects["capture"], "CAPTURE", busy=(busy_name == "capture"))
-    draw_btn(rects["auto"],    f"AUTO: {'ON' if autocapture_on else 'OFF'}",
+    draw_btn(rects["tare"],     "TARE")
+    draw_btn(rects["capture"],  "CAPTURE", busy=(busy_name == "capture"))
+    draw_btn(rects["auto"],     f"AUTO:{'ON' if autocapture_on else 'OFF'}",
              on=autocapture_on)
-    draw_btn(rects["export"],  "EXPORT USB", busy=(busy_name == "export"))
+    draw_btn(rects["export"],   "EXPORT", busy=(busy_name == "export"))
+    draw_btn(rects["quit"],     "QUIT")
+    draw_btn(rects["shutdown"], "CONFIRM?" if shutdown_armed else "SHUTDOWN",
+             warn=True)
 
     if status_text:
         surf = fonts["small"].render(status_text, True, COL_YELLOW)
-        screen.blit(surf, (dw - surf.get_width() - 10,
-                            bar_h + 6))
+        screen.blit(surf, (max(8, dw - surf.get_width() - 10), bar_h + 4))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -891,9 +938,10 @@ def main():
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     pygame.init()
     DW, DH  = cfg["display_width"], cfg["display_height"]
-    screen  = pygame.display.set_mode((DW, DH), pygame.FULLSCREEN)
+    flags   = pygame.FULLSCREEN if cfg.get("fullscreen") else 0
+    screen  = pygame.display.set_mode((DW, DH), flags)
     pygame.display.set_caption("SmartScale")
-    pygame.mouse.set_visible(False)
+    pygame.mouse.set_visible(True)
     fonts   = make_fonts()
     clock   = pygame.time.Clock()
 
@@ -901,8 +949,9 @@ def main():
     strip_y = DH - strip_h
     bar_h   = cfg["control_bar_height"]
     ctrl_rects = make_control_rects(DW, bar_h)
+    cam_area   = pygame.Rect(0, bar_h, DW, DH - bar_h - strip_h)
 
-    trigger_kg  = cfg["trigger_weight_kg"]
+    trigger_g   = cfg["trigger_weight_g"]
     stabilise_s = cfg["stabilise_seconds"]
     labels      = cfg["cell_labels"]
     autocapture = cfg["autocapture_enabled"]
@@ -914,9 +963,10 @@ def main():
     remaining     = 0.0
     cfg_mtime     = 0.0
 
-    busy_name    = None    # "capture" / "export" while a background job runs
-    status_text  = ""
-    status_until = 0.0
+    busy_name       = None    # "capture" / "export" while a background job runs
+    status_text     = ""
+    status_until    = 0.0
+    shutdown_armed_until = 0.0
 
     def set_status(text, seconds=4.0):
         nonlocal status_text, status_until
@@ -954,6 +1004,12 @@ def main():
         export_photos_to_usb(cb)
         busy_name = None
 
+    def do_shutdown():
+        set_status("Shutting down...", 30)
+        log.info("Shutdown requested from touchscreen")
+        time.sleep(0.5)
+        subprocess.run(["sudo", "shutdown", "-h", "now"])
+
     log.info("Main loop started")
 
     while True:
@@ -969,7 +1025,15 @@ def main():
                     threading.Thread(target=do_tare, daemon=True).start()
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 pos = event.pos
-                if busy_name is None:
+                now_click = time.time()
+                if ctrl_rects["shutdown"].collidepoint(pos):
+                    if now_click < shutdown_armed_until:
+                        threading.Thread(target=do_shutdown, daemon=True).start()
+                        shutdown_armed_until = 0.0
+                    else:
+                        shutdown_armed_until = now_click + 3.0
+                        set_status("Tap SHUTDOWN again to confirm", 3)
+                elif busy_name is None:
                     if ctrl_rects["tare"].collidepoint(pos):
                         threading.Thread(target=do_tare, daemon=True).start()
                     elif ctrl_rects["capture"].collidepoint(pos):
@@ -981,6 +1045,8 @@ def main():
                         set_status(f"Autocapture {'ON' if autocapture else 'OFF'}", 2)
                     elif ctrl_rects["export"].collidepoint(pos):
                         threading.Thread(target=do_export, daemon=True).start()
+                    elif ctrl_rects["quit"].collidepoint(pos):
+                        pygame.event.post(pygame.event.Event(pygame.QUIT))
 
         # ── Hardware button ──────────────────────────────────────────────
         if button.consume() and busy_name is None:
@@ -993,37 +1059,38 @@ def main():
                 cfg_mtime   = mt
                 cfg         = load_config()
                 scale.cfg   = cfg
-                trigger_kg  = cfg["trigger_weight_kg"]
+                trigger_g   = cfg["trigger_weight_g"]
                 stabilise_s = cfg["stabilise_seconds"]
                 labels      = cfg["cell_labels"]
                 strip_h     = cfg["weight_strip_height"]
                 strip_y     = DH - strip_h
+                cam_area    = pygame.Rect(0, bar_h, DW, DH - bar_h - strip_h)
                 autocapture = cfg["autocapture_enabled"]
                 log.info("Config reloaded")
         except Exception:
             pass
 
         # ── Weights ─────────────────────────────────────────────────────
-        vals    = scale.get_values()
-        mean_kg = vals["ema_mean"]
-        now     = time.time()
+        vals   = scale.get_values()
+        mean_g = vals["ema_mean_g"]
+        now    = time.time()
 
         update_shared(autocapture_enabled=autocapture, uart_ok=vals.get("uart_ok", False))
 
         # ── State machine (only auto-triggers when autocapture is ON) ────
         if state == "idle":
-            if autocapture and mean_kg >= trigger_kg:
+            if autocapture and mean_g >= trigger_g:
                 state         = "countdown"
                 countdown_end = now + stabilise_s
-                log.info(f"Trigger: {mean_kg:.3f}kg")
-            update_shared(weights=vals["ema_kg"], mean=mean_kg,
+                log.info(f"Trigger: {mean_g:.0f}g")
+            update_shared(weights_g=vals["disp_g"], mean_g=vals["disp_mean_g"],
                           status="idle", stable=vals["stable"], diag=vals["diag"])
 
         elif state == "countdown":
             remaining = countdown_end - now
             if not autocapture:
                 state = "idle"
-            elif mean_kg < trigger_kg:
+            elif mean_g < trigger_g:
                 state = "idle"
                 log.info("Weight removed — cancelled")
             elif remaining <= 0:
@@ -1033,37 +1100,41 @@ def main():
                     enforce_storage_cap(cfg["photos_max_mb"])
                 state        = "cooldown"
                 cooldown_end = now + 3.0
-            update_shared(weights=vals["ema_kg"], mean=mean_kg,
+            update_shared(weights_g=vals["disp_g"], mean_g=vals["disp_mean_g"],
                           status="countdown", countdown=max(0, remaining),
                           last_photo=last_photo, stable=vals["stable"], diag=vals["diag"])
 
         elif state == "cooldown":
-            if now >= cooldown_end and mean_kg < trigger_kg:
+            if now >= cooldown_end and mean_g < trigger_g:
                 state = "idle"
-            update_shared(weights=vals["ema_kg"], mean=mean_kg,
+            update_shared(weights_g=vals["disp_g"], mean_g=vals["disp_mean_g"],
                           status="cooldown", last_photo=last_photo,
                           stable=vals["stable"], diag=vals["diag"])
 
         # ── Draw ────────────────────────────────────────────────────────
+        screen.fill(COL_BLACK)
         frame = cam.get_frame() if cam_ok else None
         if frame is not None:
-            screen.blit(frame_to_surface(frame, DW, DH), (0, 0))
-        else:
-            screen.fill(COL_BLACK)
-            if cam_ok:
-                draw_msg(screen, fonts, "Waiting for camera...", COL_ORANGE, y=bar_h + 10)
+            blit_camera_frame(screen, frame, cam_area)
+        elif cam_ok:
+            draw_msg(screen, fonts, "Waiting for camera...", COL_ORANGE,
+                     cam_area.x + 10, cam_area.y + 10)
 
         if state == "countdown" and autocapture:
-            draw_countdown(screen, fonts, remaining, DW, DH)
+            draw_countdown(screen, fonts, remaining, cam_area)
         elif state == "cooldown" and status_text == "":
-            draw_msg(screen, fonts, "Photo saved!", COL_GREEN, y=bar_h + 10)
+            draw_msg(screen, fonts, "Photo saved!", COL_GREEN,
+                     cam_area.x + 10, cam_area.y + 10)
 
         if status_text and now > status_until:
             status_text = ""
+        shutdown_armed = now < shutdown_armed_until
+        if shutdown_armed_until and not shutdown_armed:
+            shutdown_armed_until = 0.0
 
         draw_strip(screen, fonts, vals, labels, strip_y, DW, strip_h)
         draw_control_bar(screen, fonts, ctrl_rects, DW, bar_h, autocapture,
-                          busy_name, status_text)
+                          busy_name, status_text, shutdown_armed)
         pygame.display.flip()
         clock.tick(20)
 

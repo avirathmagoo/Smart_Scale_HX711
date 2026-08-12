@@ -427,18 +427,18 @@ this file's shape over time doesn't require manual migration).
 
 | Key | Default | Meaning |
 |---|---|---|
-| `display_width` / `display_height` | 1024 / 600 | Touchscreen resolution |
+| `display_width` / `display_height` | 1024 / 600 | App window size (also the fullscreen resolution if `fullscreen` is true) |
 | `weight_strip_height` | 50 | Bottom strip height (px), on screen AND baked into photos |
 | `control_bar_height` | 50 | Top control-bar height (px) |
-| `trigger_weight_kg` | 0.5 | Autocapture fires above this |
+| `fullscreen` | false | Windowed by default — see §12 for why |
+| `trigger_weight_g` | 500 | Autocapture fires above this (grams) |
 | `stabilise_seconds` | 5.0 | Countdown before an autocapture photo (manual capture ignores this) |
-| `unit` | "kg" | Display unit (kg math is internal regardless; this is display-only in the web UI) |
 | `cell_labels` | ["C1","C2","C3","C4"] | Shown on screen, in photos, and in the calibration table |
 | `uart_port` | "/dev/serial0" | Pi's serial device talking to the ESP32 |
 | `uart_baud` | 115200 | Must match `ESP32_Code.cpp`'s `BAUD_RATE` |
 | `button_gpio` | 17 | BCM pin for the hardware capture button |
 | `offsets` | [0,0,0,0] | Pi-side tare offsets (raw counts), per channel |
-| `cal_factors` | [1.0,1.0,1.0,1.0] | Raw-counts-per-kg, per channel |
+| `cal_factors` | [1.0,1.0,1.0,1.0] | Raw-counts-per-KG, per channel (calibration-time unit only — see §12) |
 | `camera_index` | 0 | `/dev/videoN` |
 | `stream_width/height` | 640x480 | Live preview resolution |
 | `photo_width/height` | 1280x720 | Captured photo resolution |
@@ -500,3 +500,88 @@ Rough triage order, cheapest checks first:
 
 See also the Troubleshooting table in `SETUP.md`, which maps specific
 symptoms to specific fixes.
+
+---
+
+## 12. DISPLAY UNITS, FILTERING, AND WINDOW MODE (revision notes)
+
+These three things were tuned together after the first hardware test pass,
+because the original symptoms ("values changing too fast," "too many
+decimals," "looks stretched," "no way to quit") all traced back to a
+handful of root causes:
+
+### Grams, always, no decimals
+Every human-facing number — screen, photo caption, web page — is now a
+whole number of grams. Internally, `ScaleManager` still computes an
+intermediate "kg" value from `(raw - offset) / cal_factor`, purely because
+`cal_factors` is calibrated as "raw counts per kilogram" (a convenient
+calibration-time unit — you calibrate with a 1kg reference weight, not a
+1-gram one). That kg number is multiplied by 1000 and rounded the moment
+it's about to be shown or stored anywhere; nothing outside
+`ScaleManager._proc_loop` ever sees a kg value. `trigger_weight_g` in
+`config.json` is genuinely grams, not kg-with-a-different-name.
+
+### Filtering — three layers, tuned for a calm readout
+1. **Trimmed mean** over a 30-sample window (`FILTER_WINDOW`) — throws out
+   the extreme 15% high/low samples before averaging, which absorbs the
+   occasional single-sample HX711 glitch without needing a full statistical
+   filter.
+2. **EMA smoothing** at `EMA_ALPHA = 0.06` — deliberately slow. The
+   original value (0.12) let the displayed number visibly jump on every
+   ~80ms tick; 0.06 trades a bit of responsiveness for a number that
+   doesn't flicker.
+3. **Display hysteresis** (`HYSTERESIS_G = 2`) — the shown integer only
+   moves if the smoothed value has drifted at least 2g from what's
+   currently displayed. This is what actually stops the last digit from
+   flickering when the true weight sits right on a rounding boundary
+   (e.g. 245.4g/245.6g oscillating would otherwise flicker "245g"/"246g"
+   every tick even though nothing meaningful changed).
+
+If readings still feel too slow/fast for your load cells, these three
+constants (top of `scale_app.py`, just above `class ScaleManager`) are the
+only place to tune — nothing about the UART protocol or calibration math
+needs to change to adjust "feel."
+
+**If numbers still look implausible after this tuning** (not just jittery,
+but actually wrong), that's a hardware/wiring diagnosis, not a filtering
+one — verify the ESP32's raw serial output directly and independently of
+the Pi:
+```
+python3 -c "import serial; s=serial.Serial('/dev/serial0',115200,timeout=2); print(s.readline())"
+```
+If the raw `D,...` numbers themselves look wrong or erratic with the
+platform stationary and empty, the problem is in the HX711↔ESP32 wiring
+or power, not anywhere in this Python code.
+
+### Windowed mode by default, plus on-screen QUIT/SHUTDOWN
+The original version always opened fullscreen (`pygame.FULLSCREEN`). On
+a touchscreen whose native resolution doesn't exactly match
+`display_width`/`display_height`, SDL's fullscreen mode can letterbox
+(black bars) and — more importantly — can shift the mapping between touch
+coordinates and window coordinates, so taps land in the wrong place. Two
+independent fixes:
+
+- **`fullscreen` defaults to `false`** in `config.json` — the app now opens
+  as a normal window at exactly `display_width`×`display_height`, which
+  sidesteps any SDL-fullscreen/resolution mismatch entirely. Flip it back
+  on in the web UI's Display section if your setup doesn't have this
+  problem and you prefer true fullscreen.
+- **The camera feed is now drawn aspect-correct, not stretched.** A
+  previous version blitted the (4:3) camera frame across the *entire*
+  screen rectangle regardless of the screen's own aspect ratio, visibly
+  distorting the image. `blit_camera_frame()` now scales the frame to fit
+  inside the area between the control bar and weight strip while
+  preserving its original aspect ratio, letterboxing with black bars on
+  the sides/top/bottom rather than stretching. This is the "black bar
+  below the app" you may have been seeing — it's now an intentional,
+  correct letterbox, not a bug (in windowed mode with a matching
+  resolution, the bars should mostly disappear).
+- **QUIT and SHUTDOWN buttons were added to the control bar** (now six
+  buttons: TARE / CAPTURE / AUTO / EXPORT / QUIT / SHUTDOWN) because
+  fullscreen kiosk-style touchscreens often have no window manager chrome
+  (no title bar close button) — there needs to be an in-app way out
+  regardless of window mode. SHUTDOWN requires two taps within 3 seconds
+  (button reads "CONFIRM?" after the first tap) since it powers off the
+  whole Pi — this uses the same passwordless `sudo shutdown` sudoers rule
+  already set up for the web UI's Shutdown button, so no extra sudoers
+  config is needed for it.

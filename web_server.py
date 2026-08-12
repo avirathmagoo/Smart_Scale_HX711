@@ -61,9 +61,9 @@ def logout():
 DEFAULT_CONFIG = {
     "display_width": 1024, "display_height": 600,
     "weight_strip_height": 50, "control_bar_height": 50,
-    "trigger_weight_kg": 0.5,
+    "fullscreen": False,
+    "trigger_weight_g": 500,
     "stabilise_seconds": 5.0,
-    "unit": "kg",
     "cell_labels": ["C1", "C2", "C3", "C4"],
     "uart_port": "/dev/serial0", "uart_baud": 115200,
     "button_gpio": 17,
@@ -100,7 +100,7 @@ def get_live():
         return get_shared()
     except Exception:
         return {
-            "weights": [0,0,0,0], "mean": 0,
+            "weights_g": [0,0,0,0], "mean_g": 0,
             "status": "unknown", "countdown": 0,
             "last_photo": "", "stable": False,
             "diag": ["no_data"]*4, "uart_ok": False,
@@ -135,7 +135,7 @@ def index():
 def save_scale():
     cfg = load_config()
     try:
-        cfg["trigger_weight_kg"] = float(request.form["trigger_weight_kg"])
+        cfg["trigger_weight_g"] = int(float(request.form["trigger_weight_g"]))
         cfg["stabilise_seconds"] = float(request.form["stabilise_seconds"])
         cfg["cell_labels"] = [
             request.form.get(f"label{i}", f"C{i+1}") for i in range(4)
@@ -172,6 +172,7 @@ def save_display():
         cfg["display_width"]       = int(request.form["display_width"])
         cfg["display_height"]      = int(request.form["display_height"])
         cfg["weight_strip_height"] = int(request.form["weight_strip_height"])
+        cfg["fullscreen"]          = request.form.get("fullscreen") == "on"
         save_config(cfg)
         flash("Display settings saved. Restart the scale app to apply.", "ok")
     except Exception as e:
