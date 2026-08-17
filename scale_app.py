@@ -165,7 +165,7 @@ class UARTReader:
             return
 
         try:
-            values = [float(part.strip()) for part in parts]
+            values = [int(round(float(part.strip()))) for part in parts]
         except ValueError:
             self._invalid_count += 1
             return
@@ -233,13 +233,13 @@ class ScaleManager:
             offsets = self.cfg.get("offsets", [0.0] * 4)
 
             if link_ok:
-                values = [raw[i] - offsets[i] for i in range(4)]
+                values = [int(round(raw[i] - offsets[i])) for i in range(4)]
                 diags = ["ok"] * 4
             else:
                 values = [0.0] * 4
                 diags = ["no_data"] * 4
 
-            mean_g = sum(values) / 4.0
+            mean_g = int(round(sum(values) / 4.0))
 
             with self._out_lock:
                 self._out = {
@@ -263,7 +263,7 @@ class ScaleManager:
             log.error("Tare failed — no valid ESP32 data")
             return False
 
-        values = self.uart.get_latest()
+        values = [int(round(v)) for v in self.uart.get_latest()]
         self.cfg["offsets"] = values
         save_config(self.cfg)
         log.info(f"Tare done — offsets: {[round(v, 3) for v in values]}")
@@ -453,8 +453,8 @@ def save_photo(frame, vals, labels, strip_h) -> str:
 
     disp_g = vals["disp_g"]
     mean_g = vals["disp_mean_g"]
-    parts = [f"{labels[i]}: {disp_g[i]}g" for i in range(4)]
-    parts.append(f"MEAN: {mean_g}g")
+    parts = [f"{labels[i]}: {int(round(disp_g[i]))}g" for i in range(4)]
+    parts.append(f"MEAN: {int(round(mean_g))}g")
     cv2.putText(photo, "   |   ".join(parts),
                 (10, strip_y + strip_h - 10),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.58,
@@ -645,7 +645,7 @@ def draw_strip(screen, fonts, vals, labels, strip_y, dw, sh):
     stbl   = vals["stable"]
     uart_ok = vals.get("uart_ok", True)
 
-    parts = [f"{labels[i]}: {disp_g[i]}g" for i in range(4)]
+    parts = [f"{labels[i]}: {int(round(disp_g[i]))}g" for i in range(4)]
     mean_txt = f"MEAN: {mean_g}g" + (" \u2713" if stbl else "")
     text = "   |   ".join(parts) + "   |   " + mean_txt
     if not uart_ok:
