@@ -107,36 +107,22 @@ def save_config(cfg):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# UART READER — talks to the ESP32 (read-only stream, no commands sent)
-# ═══════════════════════════════════════════════════════════════════════════════
+# UART READER — talks to the ESP32
 try:
     import serial
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
-    log.warning("pyserial not available — simulation mode")
+    log.warning("pyserial not available")
 
-RING_DEPTH   = 20     # raw samples kept per channel (ESP32 already averages
-                       # 4 samples on-device and sends at ~6.7Hz, so this is
-                       # ~3 seconds of already-smoothed data)
-LINK_TIMEOUT = 2.0    # seconds without a valid packet before "disconnected"
-
-_DATA_RE = re.compile(r"^D,(-?\d+),(-?\d+),(-?\d+),(-?\d+),([0-9A-Fa-f]{2})$")
-
+LINK_TIMEOUT = 2.0
 
 class UARTReader:
-    """
-    Owns the serial connection to the ESP32.
-    Background thread continuously reads lines, validates the checksum,
-    and appends good raw samples to per-channel ring buffers. This is
-    READ-ONLY — the Pi never writes anything to the ESP32 in this version.
-    """
-
     def __init__(self, port: str, baud: int):
         self.port = port
         self.baud = baud
-        self._ring = [collections.deque(maxlen=RING_DEPTH) for _ in range(4)]
-        self._ring_lock = threading.Lock()
+        self._latest = [0.0] * 4
+        self._lock = threading.Lock()
         self._last_packet_time = 0.0
         self._valid_count = 0
         self._invalid_count = 0
@@ -148,28 +134,15 @@ class UARTReader:
                 self._ser = serial.Serial(port, baud, timeout=1.0)
                 log.info(f"UART opened: {port} @ {baud}")
             except Exception as e:
-                log.error(f"UART open failed ({port}): {e} — simulation mode")
-                self._ser = None
-        else:
-            self._ser = None
+                log.error(f"UART open failed ({port}): {e}")
 
     def start(self):
-        t = threading.Thread(target=self._read_loop, daemon=True, name="uart-reader")
-        t.start()
+        threading.Thread(target=self._read_loop, daemon=True, name="uart-reader").start()
 
     def _read_loop(self):
-        sim_base = [0, 0, 0, 0]
         while not self._stop.is_set():
             if self._ser is None:
-                # Simulation mode — lets the UI run for development/testing
-                # without hardware attached.
-                import random
-                for i in range(4):
-                    sim_base[i] += random.randint(-50, 50)
-                    with self._ring_lock:
-                        self._ring[i].append(sim_base[i])
-                self._last_packet_time = time.time()
-                time.sleep(0.15)
+                time.sleep(0.2)
                 continue
 
             try:
@@ -182,39 +155,30 @@ class UARTReader:
             if not line:
                 continue
 
-            if line.startswith("D,"):
-                self._handle_data_line(line)
-            elif line.startswith("A,READY"):
-                log.info("ESP32 reported READY")
-            # Anything else (boot banner noise, partial lines) is ignored.
+            self._handle_data_line(line)
 
     def _handle_data_line(self, line: str):
-        m = _DATA_RE.match(line)
-        if not m:
+        parts = line.split(",")
+
+        if len(parts) != 4:
             self._invalid_count += 1
             return
 
-        r1, r2, r3, r4, chk_hex = m.groups()
-        body = f"{r1},{r2},{r3},{r4}"
-        checksum = 0
-        for ch in body:
-            checksum ^= ord(ch)
-        if checksum != int(chk_hex, 16):
+        try:
+            values = [float(part.strip()) for part in parts]
+        except ValueError:
             self._invalid_count += 1
-            log.debug(f"UART checksum mismatch: {line}")
             return
+
+        with self._lock:
+            self._latest = values
 
         self._valid_count += 1
         self._last_packet_time = time.time()
-        vals = [int(r1), int(r2), int(r3), int(r4)]
-        with self._ring_lock:
-            for i in range(4):
-                self._ring[i].append(vals[i])
 
-    # ── Public API ─────────────────────────────────────────────────────────
-    def get_snapshot(self):
-        with self._ring_lock:
-            return [list(buf) for buf in self._ring]
+    def get_latest(self):
+        with self._lock:
+            return list(self._latest)
 
     @property
     def connected(self) -> bool:
@@ -236,140 +200,58 @@ class UARTReader:
                 pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# CALIBRATION / FILTER PIPELINE
-# ═══════════════════════════════════════════════════════════════════════════════
-# The ESP32 now sends already-averaged (4-sample) raw readings at ~6.7Hz, so
-# the Pi doesn't need to do as much heavy lifting as before — these settings
-# are lighter/faster than earlier drafts on purpose, since over-filtering
-# clean data just adds lag without adding accuracy. If readings still feel
-# jittery on your hardware, widen FILTER_WINDOW or lower EMA_ALPHA; if they
-# feel sluggish, do the opposite. HYSTERESIS_G is what actually stops the
-# last digit from flickering — that one rarely needs changing.
-
-FILTER_WINDOW  = 12    # raw samples used per filtered output (~2.5s @ ESP32's rate)
-EMA_ALPHA       = 0.15 # display smoothing (lower = smoother, slower to settle)
-STABLE_THRESH_G = 3     # grams — mean must stay within this to be "stable"
-STABLE_COUNT    = 8     # consecutive stable readings needed
-HYSTERESIS_G    = 2     # grams — minimum change before the shown number moves
-
-
-def _trimmed_mean(samples):
-    if not samples:
-        return 0.0
-    k = max(1, int(len(samples) * 0.15))
-    trimmed = sorted(samples)[k: len(samples) - k]
-    return sum(trimmed) / len(trimmed) if trimmed else sum(samples) / len(samples)
-
-
+# SCALE PROCESSING — ESP32 does all scale calculation.
+# The Pi performs only tare: displayed value = ESP32 value - tare offset.
 class ScaleManager:
-    """
-    Owns a UARTReader and a processing thread that filters + calibrates
-    the raw stream into GRAM values. tare()/calibrate() read directly from
-    the current ring-buffer snapshot — no pausing needed, since the
-    UARTReader thread is an independent producer. Tare is PI-SIDE ONLY;
-    the ESP32 is never asked to do anything — it just streams.
-    """
-
     def __init__(self, cfg: dict):
-        self.cfg   = cfg
-        self.uart  = UARTReader(cfg["uart_port"], cfg["uart_baud"])
-
+        self.cfg = cfg
+        self.uart = UARTReader(cfg["uart_port"], cfg["uart_baud"])
         self._out_lock = threading.Lock()
         self._out = {
-            "g":            [0.0] * 4,   # instantaneous filtered grams (float)
-            "ema_g":        [0.0] * 4,   # smoothed grams (float)
-            "disp_g":       [0] * 4,     # hysteresis-held integer grams (for display)
-            "mean_g":       0.0,
-            "ema_mean_g":   0.0,
-            "disp_mean_g":  0,
-            "stable":       False,
-            "diag":         ["no_data"] * 4,
-            "uart_ok":      False,
+            "g": [0.0] * 4,
+            "ema_g": [0.0] * 4,
+            "disp_g": [0.0] * 4,
+            "mean_g": 0.0,
+            "ema_mean_g": 0.0,
+            "disp_mean_g": 0.0,
+            "stable": True,
+            "diag": ["no_data"] * 4,
+            "uart_ok": False,
         }
-
-        self._ema_g       = [0.0] * 4
-        self._ema_mean_g  = 0.0
-        self._prev_ema     = 0.0
-        self._stable_ctr   = 0
-        self._disp_g       = [0] * 4
-        self._disp_mean_g  = 0
-
         self._stop = threading.Event()
-
         log.info(f"ScaleManager init — UART={cfg['uart_port']}@{cfg['uart_baud']}")
 
     def start(self):
         self.uart.start()
-        t = threading.Thread(target=self._proc_loop, daemon=True, name="hx711-proc")
-        t.start()
-        log.info("Processing thread started")
+        threading.Thread(target=self._proc_loop, daemon=True, name="scale-values").start()
 
     def _proc_loop(self):
         while not self._stop.is_set():
-            time.sleep(0.1)
-
-            snap = self.uart.get_snapshot()
+            time.sleep(0.05)
+            raw = self.uart.get_latest()
             link_ok = self.uart.connected
+            offsets = self.cfg.get("offsets", [0.0] * 4)
 
-            g_vals = []
-            diags  = []
-
-            for i in range(4):
-                buf = snap[i]
-
-                if not link_ok or len(buf) < 3:
-                    g_vals.append(self._ema_g[i])
-                    diags.append("no_data")
-                    continue
-
-                window   = buf[-FILTER_WINDOW:]
-                raw_avg  = _trimmed_mean(window)
-
-                offset = self.cfg["offsets"][i]
-                factor = self.cfg["cal_factors"][i]
-                factor = factor if abs(factor) >= 1 else 1.0
-                kg     = (raw_avg - offset) / factor
-                grams  = kg * 1000.0
-
-                g_vals.append(grams)
-                diags.append("ok")
-
-            mean_g = sum(g_vals) / len(g_vals)
-
-            a = EMA_ALPHA
-            ema_g    = [a * g_vals[i] + (1 - a) * self._ema_g[i] for i in range(4)]
-            ema_mean = a * mean_g + (1 - a) * self._ema_mean_g
-
-            if abs(ema_mean - self._prev_ema) < STABLE_THRESH_G:
-                self._stable_ctr = min(self._stable_ctr + 1, STABLE_COUNT + 1)
+            if link_ok:
+                values = [raw[i] - offsets[i] for i in range(4)]
+                diags = ["ok"] * 4
             else:
-                self._stable_ctr = 0
-            stable = self._stable_ctr >= STABLE_COUNT
+                values = [0.0] * 4
+                diags = ["no_data"] * 4
 
-            # Display hysteresis — only move the shown integer if the
-            # smoothed value has actually moved past the threshold.
-            disp_g = list(self._disp_g)
-            for i in range(4):
-                rounded = round(ema_g[i])
-                if abs(rounded - disp_g[i]) >= HYSTERESIS_G:
-                    disp_g[i] = rounded
-            disp_mean_g = self._disp_mean_g
-            rounded_mean = round(ema_mean)
-            if abs(rounded_mean - disp_mean_g) >= HYSTERESIS_G:
-                disp_mean_g = rounded_mean
-
-            self._ema_g       = ema_g
-            self._ema_mean_g  = ema_mean
-            self._prev_ema     = ema_mean
-            self._disp_g       = disp_g
-            self._disp_mean_g  = disp_mean_g
+            mean_g = sum(values) / 4.0
 
             with self._out_lock:
                 self._out = {
-                    "g": g_vals, "ema_g": ema_g, "disp_g": disp_g,
-                    "mean_g": mean_g, "ema_mean_g": ema_mean, "disp_mean_g": disp_mean_g,
-                    "stable": stable, "diag": diags, "uart_ok": link_ok,
+                    "g": values,
+                    "ema_g": values,
+                    "disp_g": values,
+                    "mean_g": mean_g,
+                    "ema_mean_g": mean_g,
+                    "disp_mean_g": mean_g,
+                    "stable": True,
+                    "diag": diags,
+                    "uart_ok": link_ok,
                 }
 
     def get_values(self) -> dict:
@@ -377,114 +259,61 @@ class ScaleManager:
             return dict(self._out)
 
     def tare(self) -> bool:
-        """Pi-side tare — the only kind of tare in this version. Zeros the
-        current filtered raw baseline. Nothing is sent to the ESP32."""
-        snap = self.uart.get_snapshot()
-        new_offsets = []
-        ok = True
-        for i in range(4):
-            buf = snap[i]
-            if len(buf) < 3:
-                log.error(f"Tare: channel {i} has no data yet")
-                ok = False
-                new_offsets.append(self.cfg["offsets"][i])
-            else:
-                new_offsets.append(_trimmed_mean(buf))
-
-        if ok:
-            self.cfg["offsets"] = new_offsets
-            save_config(self.cfg)
-            with self._out_lock:
-                self._ema_g, self._ema_mean_g, self._prev_ema = [0.0]*4, 0.0, 0.0
-                self._stable_ctr = 0
-                self._disp_g, self._disp_mean_g = [0]*4, 0
-            log.info(f"Tare done — offsets: {[round(o) for o in new_offsets]}")
-        return ok
-
-    def calibrate(self, known_kg: float) -> bool:
-        if known_kg <= 0:
-            log.error(f"Calibrate: invalid known_kg={known_kg}")
+        if not self.uart.connected:
+            log.error("Tare failed — no valid ESP32 data")
             return False
 
-        snap = self.uart.get_snapshot()
-        new_factors = []
-        valid = []
-
-        for i in range(4):
-            buf = snap[i]
-            if len(buf) < 3:
-                log.warning(f"Calibrate: channel {i} has no data — skipping")
-                new_factors.append(None)
-                continue
-
-            avg = _trimmed_mean(buf)
-            net = avg - self.cfg["offsets"][i]
-            if abs(net) < 500:
-                log.warning(f"Calibrate: channel {i} net too small ({net:.1f}) — skipping")
-                new_factors.append(None)
-                continue
-
-            factor = net / known_kg
-            if not (100 <= abs(factor) <= 5_000_000):
-                log.warning(f"Calibrate: channel {i} factor={factor:.1f} out of range — skipping")
-                new_factors.append(None)
-                continue
-
-            new_factors.append(factor)
-            valid.append(factor)
-
-        if not valid:
-            log.error("Calibrate: no valid factors — check load placement / wiring")
-            return False
-
-        mean_f = sum(valid) / len(valid)
-        final  = [f if f is not None else mean_f for f in new_factors]
-        self.cfg["cal_factors"] = final
+        values = self.uart.get_latest()
+        self.cfg["offsets"] = values
         save_config(self.cfg)
-        log.info(f"Calibrate done — factors: {[round(f) for f in final]}")
+        log.info(f"Tare done — offsets: {[round(v, 3) for v in values]}")
         return True
 
+    def calibrate(self, known_kg: float) -> bool:
+        log.warning("Calibration is disabled. ESP32 values are used directly.")
+        return False
+
     def diagnostics(self) -> dict:
-        return {**self.uart.stats(), "offsets": self.cfg["offsets"],
-                "cal_factors": self.cfg["cal_factors"]}
+        return {**self.uart.stats(), "offsets": self.cfg.get("offsets", [0, 0, 0, 0]),
+                "cal_factors": self.cfg.get("cal_factors", [1, 1, 1, 1])}
 
     def cleanup(self):
         self._stop.set()
         self.uart.cleanup()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SHARED STATE for Flask  (grams throughout)
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# SHARED STATE for Flask
 _shared = {
-    "weights_g": [0]*4, "mean_g": 0,
-    "status": "idle", "countdown": 0,
-    "last_photo": "", "stable": False,
-    "diag": ["no_data"]*4, "uart_ok": False,
+    "weights_g": [0] * 4,
+    "mean_g": 0,
+    "status": "idle",
+    "countdown": 0,
+    "last_photo": "",
+    "stable": True,
+    "diag": ["no_data"] * 4,
+    "uart_ok": False,
     "autocapture_enabled": True,
 }
 _shared_lock = threading.Lock()
 
+
 def update_shared(**kw):
     with _shared_lock:
         _shared.update(kw)
+
 
 def get_shared() -> dict:
     with _shared_lock:
         return dict(_shared)
 
 
-# Module-level handle to the running ScaleManager, so web_server.py (running
-# in the same process, via launcher.py) can drive tare/calibrate through the
-# SAME UART connection instead of opening a second, conflicting one.
 _scale_manager = None
+
 
 def get_scale_manager():
     return _scale_manager
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # HARDWARE CAPTURE BUTTON — GPIO17, grounded = pressed
 # ═══════════════════════════════════════════════════════════════════════════════
 try:
