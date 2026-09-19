@@ -1,26 +1,13 @@
 """
-Smart Scale — Main Application  (UART / ESP32 edition, v3)
+Smart Scale — Main Application  (UART / ESP32 edition, v4)
 Raspberry Pi 4B | ESP32 (4x HX711 bridge, over UART) | USB Webcam | 1024x600
 
 ARCHITECTURE
-  uart-reader thread — reads ESP32 packets, validates checksum, fills ring buffers
-  hx711-proc  thread — filtering + calibration (Pi-side), publishes gram values
-  camera      thread — frame grab (lowest priority)
-  button      thread — GPIO17 hardware capture button (interrupt-driven)
+  uart-reader thread — reads ESP32 packets, validates checksum
+  hx711-proc  thread — fetches values directly to display (no Pi-side math)
+  camera      thread — frame grab
+  button      thread — GPIO hardware capture and tare buttons
   main        thread — pygame display + state machine + touch controls
-
-The ESP32 ONLY reads sensors and streams raw data — it has no tare/command
-handling at all (v2 firmware). All tare and calibration math lives entirely
-on the Pi. This is a deliberate simplification: an earlier version sent a
-tare command to the ESP32, but the ESP32's tare routine paused its main
-loop long enough that the Pi saw it as a dead link. Removing that
-coordination entirely fixed both problems at once — see context.md §12.
-
-DISPLAY UNITS: everything shown to a person — screen, photos, web page — is
-in whole GRAMS, no decimals. Calibration math internally still works in kg
-(cal_factors are "raw counts per kg", same convention as before) purely
-because that's a convenient calibration-time unit; the moment a value is
-meant for a human it's converted to grams and rounded.
 """
 
 import cv2
@@ -62,27 +49,21 @@ DEFAULT_CONFIG = {
     "weight_strip_height":  50,
     "control_bar_height":   50,
     "fullscreen":           False,
-    "trigger_weight_g":     500,     # grams — everything user-facing is grams
+    "trigger_weight_g":     500,
     "stabilise_seconds":    5.0,
     "cell_labels":          ["C1", "C2", "C3", "C4"],
-    # UART link to the ESP32
     "uart_port":             "/dev/serial0",
     "uart_baud":             115200,
-    # Hardware capture button
     "button_gpio":           17,
-    # Calibration — internally raw-counts-per-KG (calibration-time convenience
-    # unit only); every consumer of ScaleManager output sees grams.
+    "tare_button_gpio":      27, # Second hardware button for Tare
     "offsets":              [0, 0, 0, 0],
     "cal_factors":          [1.0, 1.0, 1.0, 1.0],
-    # Camera
     "camera_index":         0,
     "stream_width":         640,
     "stream_height":        480,
     "photo_width":          1280,
     "photo_height":         720,
-    # Behaviour
     "autocapture_enabled":  True,
-    # Storage cap — 32GB SD card; default leaves headroom for OS + packages
     "photos_max_mb":        20000,
 }
 
@@ -105,7 +86,6 @@ def save_config(cfg):
         with open(CONFIG_FILE, "w") as f:
             json.dump(cfg, f, indent=2)
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # UART READER — talks to the ESP32
 try:
@@ -121,7 +101,7 @@ class UARTReader:
     def __init__(self, port: str, baud: int):
         self.port = port
         self.baud = baud
-        self._latest = [0.0] * 4
+        self._latest = [0.0] * 5  # Expecting 5 values: W1, W2, W3, W4, Total
         self._lock = threading.Lock()
         self._last_packet_time = 0.0
         self._valid_count = 0
@@ -158,14 +138,30 @@ class UARTReader:
             self._handle_data_line(line)
 
     def _handle_data_line(self, line: str):
+        # Ignore debug printouts, only process data lines
+        if not line.startswith("D,"):
+            return
+            
         parts = line.split(",")
 
-        if len(parts) != 4:
+        # Expected format: D,<W1>,<W2>,<W3>,<W4>,<Avg>,<Checksum>
+        if len(parts) != 7:
             self._invalid_count += 1
             return
 
+        payload = ",".join(parts[1:6])
+        
         try:
-            values = [int(round(float(part.strip()))) for part in parts]
+            csum_recv = int(parts[6].strip(), 16)
+            csum_calc = 0
+            for char in payload:
+                csum_calc ^= ord(char)
+                
+            if csum_recv != csum_calc:
+                self._invalid_count += 1
+                return
+                
+            values = [float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])]
         except ValueError:
             self._invalid_count += 1
             return
@@ -200,8 +196,7 @@ class UARTReader:
                 pass
 
 
-# SCALE PROCESSING — ESP32 does all scale calculation.
-# The Pi performs only tare: displayed value = ESP32 value - tare offset.
+# SCALE PROCESSING — Values are pushed directly to display arrays (No local math)
 class ScaleManager:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -230,16 +225,16 @@ class ScaleManager:
             time.sleep(0.05)
             raw = self.uart.get_latest()
             link_ok = self.uart.connected
-            offsets = self.cfg.get("offsets", [0.0] * 4)
 
-            if link_ok:
-                values = [int(round(raw[i] - offsets[i])) for i in range(4)]
+            # Expecting exactly 5 elements returned from get_latest()
+            if link_ok and len(raw) == 5:
+                values = [int(round(raw[i])) for i in range(4)]
+                mean_g = int(round(raw[4]))
                 diags = ["ok"] * 4
             else:
-                values = [0.0] * 4
+                values = [0] * 4
+                mean_g = 0
                 diags = ["no_data"] * 4
-
-            mean_g = int(round(sum(values) / 4.0))
 
             with self._out_lock:
                 self._out = {
@@ -259,18 +254,22 @@ class ScaleManager:
             return dict(self._out)
 
     def tare(self) -> bool:
-        if not self.uart.connected:
+        if not self.uart.connected or self.uart._ser is None:
             log.error("Tare failed — no valid ESP32 data")
             return False
 
-        values = [int(round(v)) for v in self.uart.get_latest()]
-        self.cfg["offsets"] = values
-        save_config(self.cfg)
-        log.info(f"Tare done — offsets: {[round(v, 3) for v in values]}")
-        return True
+        try:
+            # 0xAA 0x55 0x01 'T' 'A' 'R' 'E' '\r' '\n'
+            self.uart._ser.write(b'\xAA\x55\x01TARE\r\n')
+            self.uart._ser.flush()
+            log.info("Sent hex TARE command to ESP32")
+            return True
+        except Exception as e:
+            log.error(f"Failed to send TARE command: {e}")
+            return False
 
     def calibrate(self, known_kg: float) -> bool:
-        log.warning("Calibration is disabled. ESP32 values are used directly.")
+        log.warning("Calibration is disabled on Pi. ESP32 values are used directly.")
         return False
 
     def diagnostics(self) -> dict:
@@ -296,33 +295,25 @@ _shared = {
 }
 _shared_lock = threading.Lock()
 
-
 def update_shared(**kw):
     with _shared_lock:
         _shared.update(kw)
-
 
 def get_shared() -> dict:
     with _shared_lock:
         return dict(_shared)
 
-
 _scale_manager = None
-
-
 def get_scale_manager():
     return _scale_manager
 
-
-# HARDWARE CAPTURE BUTTON — GPIO17, grounded = pressed
-# ═══════════════════════════════════════════════════════════════════════════════
+# HARDWARE CAPTURE BUTTON
 try:
     import RPi.GPIO as GPIO
     GPIO_AVAILABLE = True
 except ImportError:
     GPIO_AVAILABLE = False
-    log.warning("RPi.GPIO not available — hardware capture button disabled")
-
+    log.warning("RPi.GPIO not available — hardware capture buttons disabled")
 
 class CaptureButton:
     def __init__(self, pin: int):
@@ -337,18 +328,14 @@ class CaptureButton:
                 GPIO.add_event_detect(pin, GPIO.FALLING,
                                        callback=self._on_press, bouncetime=250)
                 self._enabled = True
-                log.info(f"Capture button armed on GPIO{pin}")
+                log.info(f"Button armed on GPIO{pin}")
             except Exception as e:
-                log.error(f"Capture button setup failed on GPIO{pin}: {e} — "
-                          f"hardware button disabled, on-screen button still works. "
-                          f"See context.md troubleshooting if this persists "
-                          f"(often a gpio-group or RPi.GPIO/kernel compatibility issue).")
+                log.error(f"Button setup failed on GPIO{pin}: {e}")
 
     def _on_press(self, channel):
         self.event.set()
 
     def consume(self) -> bool:
-        """Returns True exactly once per press."""
         if self.event.is_set():
             self.event.clear()
             return True
@@ -362,10 +349,7 @@ class CaptureButton:
                 pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # CAMERA
-# ═══════════════════════════════════════════════════════════════════════════════
-
 class Camera:
     def __init__(self, index, sw, sh, pw, ph):
         self.index = index
@@ -439,10 +423,7 @@ class Camera:
             self._cap.release()
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PHOTO SAVE + STORAGE CAP  (grams, no decimals, in the caption)
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# PHOTO SAVE + STORAGE CAP
 def save_photo(frame, vals, labels, strip_h) -> str:
     photo   = frame.copy()
     h, w    = photo.shape[:2]
@@ -468,8 +449,6 @@ def save_photo(frame, vals, labels, strip_h) -> str:
 
 
 def enforce_storage_cap(max_mb: int):
-    """Deletes the oldest photos until the photos/ folder is back under
-    the configured cap. Runs after every save; cheap (folder is small)."""
     try:
         cap_bytes = max_mb * 1024 * 1024
         files = sorted(Path(PHOTOS_DIR).glob("*.jpg"), key=os.path.getmtime)
@@ -486,14 +465,8 @@ def enforce_storage_cap(max_mb: int):
     except Exception as e:
         log.error(f"Storage cap check failed: {e}")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# USB EXPORT  — zips photos/ and copies it to an inserted USB drive
-# ═══════════════════════════════════════════════════════════════════════════════
-
+# USB EXPORT
 def _find_usb_partition():
-    """Returns a /dev/sdXN path for the first USB-attached partition with a
-    filesystem, or None if nothing suitable is found."""
     try:
         out = subprocess.run(
             ["lsblk", "-J", "-o", "NAME,TRAN,TYPE,FSTYPE,MOUNTPOINT"],
@@ -512,14 +485,8 @@ def _find_usb_partition():
                 return f"/dev/{child['name']}"
     return None
 
-
 def _clean_udisks_path(raw: str) -> str:
-    """udisksctl wraps paths in old-style Unix quoting on some message
-    types — e.g. an "already mounted" error prints `/media/x/Y'. (backtick
-    ... apostrophe-period), while a fresh "Mounted at" message doesn't.
-    Strip any of that decorative punctuation so both forms parse the same."""
     return raw.strip("`'\".,")
-
 
 def _udisks_mount(devpath: str):
     try:
@@ -534,7 +501,6 @@ def _udisks_mount(devpath: str):
         log.error(f"USB export: mount failed: {e}")
         return None
 
-
 def _udisks_unmount(devpath: str):
     try:
         subprocess.run(["udisksctl", "unmount", "-b", devpath],
@@ -542,15 +508,7 @@ def _udisks_unmount(devpath: str):
     except Exception as e:
         log.warning(f"USB export: unmount failed (drive can still be removed): {e}")
 
-
 def export_photos_to_usb(status_cb):
-    """Zips PHOTOS_DIR and copies the zip to a plugged-in USB drive.
-    status_cb(text) is called with short progress strings the caller can
-    show on screen. Never deletes anything from the Pi.
-
-    Requires passwordless udisks2 mount for the current user — see the
-    polkit rule in SETUP.md (Part 6). Without it, mounting will hang
-    waiting for a password prompt no one can answer from the touchscreen."""
     status_cb("Looking for USB drive...")
     dev = _find_usb_partition()
     if not dev:
@@ -592,10 +550,7 @@ def export_photos_to_usb(status_cb):
         _udisks_unmount(dev)
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
 # PYGAME HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
 COL_WHITE  = (255, 255, 255)
 COL_BLACK  = (0,   0,   0  )
 COL_GREEN  = (0,   210, 0  )
@@ -617,9 +572,6 @@ def make_fonts():
     }
 
 def blit_camera_frame(screen, frame, area: pygame.Rect):
-    """Draws the camera frame INSIDE `area`, preserving its aspect ratio
-    (letterboxed with black bars if the frame's aspect doesn't match the
-    area's) instead of stretching it to fill a mismatched rectangle."""
     fh, fw = frame.shape[:2]
     if fw == 0 or fh == 0:
         return
@@ -629,7 +581,7 @@ def blit_camera_frame(screen, frame, area: pygame.Rect):
     off_x = area.x + (area.w - draw_w) // 2
     off_y = area.y + (area.h - draw_h) // 2
 
-    pygame.draw.rect(screen, COL_BLACK, area)  # letterbox background
+    pygame.draw.rect(screen, COL_BLACK, area)
 
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     rgb = cv2.resize(rgb, (draw_w, draw_h), interpolation=cv2.INTER_LINEAR)
@@ -670,8 +622,6 @@ def draw_msg(screen, fonts, text, color, x, y):
     surf = fonts["medium"].render(text, True, color)
     screen.blit(surf, (x, y))
 
-
-# ── Control bar (top strip): TARE | CAPTURE | AUTO [slider] | EXPORT | QUIT | SHUTDOWN
 BUTTON_ORDER = ("tare", "capture", "auto", "export", "quit", "shutdown")
 
 def make_control_rects(dw, bar_h):
@@ -712,7 +662,6 @@ def draw_control_bar(screen, fonts, rects, dw, bar_h, autocapture_on,
         surf = fonts["small"].render(status_text, True, COL_YELLOW)
         screen.blit(surf, (max(8, dw - surf.get_width() - 10), bar_h + 4))
 
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -721,24 +670,19 @@ def main():
     global _scale_manager
     cfg = load_config()
 
-    # ── Scale: start acquisition, then Pi-side tare (nothing sent to ESP32) ─
     scale = ScaleManager(cfg)
     _scale_manager = scale
     scale.start()
-    log.info("Startup tare — platform must be EMPTY. Waiting 2s for UART data...")
-    time.sleep(2)
-    scale.tare()
+    log.info("Started Pi reader (Math processed on ESP32)...")
 
-    # ── Hardware capture button ─────────────────────────────────────────────
     button = CaptureButton(cfg["button_gpio"])
+    tare_button = CaptureButton(cfg.get("tare_button_gpio", 27))
 
-    # ── Camera ─────────────────────────────────────────────────────────────
     cam    = Camera(cfg["camera_index"],
                     cfg["stream_width"], cfg["stream_height"],
                     cfg["photo_width"],  cfg["photo_height"])
     cam_ok = cam.start()
 
-    # ── Pygame ─────────────────────────────────────────────────────────────
     os.environ.setdefault("SDL_VIDEODRIVER", "x11")
     pygame.init()
     DW, DH  = cfg["display_width"], cfg["display_height"]
@@ -767,7 +711,7 @@ def main():
     remaining     = 0.0
     cfg_mtime     = 0.0
 
-    busy_name       = None    # "capture" / "export" / "tare" while a background job runs
+    busy_name       = None
     status_text     = ""
     status_until    = 0.0
     shutdown_armed_until = 0.0
@@ -796,7 +740,7 @@ def main():
         nonlocal busy_name
         busy_name = "tare"
         ok = scale.tare()
-        set_status("Tare complete" if ok else "Tare failed — no data from ESP32 yet")
+        set_status("Tare complete" if ok else "Tare failed")
         busy_name = None
 
     def do_export():
@@ -819,10 +763,10 @@ def main():
         # ── Events ─────────────────────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                cam.stop(); button.cleanup(); pygame.quit(); scale.cleanup(); return
+                cam.stop(); button.cleanup(); tare_button.cleanup(); pygame.quit(); scale.cleanup(); return
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_q:
-                    cam.stop(); button.cleanup(); pygame.quit(); scale.cleanup()
+                    cam.stop(); button.cleanup(); tare_button.cleanup(); pygame.quit(); scale.cleanup()
                     log.info("Stopped"); return
                 elif event.key == pygame.K_t:
                     threading.Thread(target=do_tare, daemon=True).start()
@@ -851,9 +795,12 @@ def main():
                     elif ctrl_rects["quit"].collidepoint(pos):
                         pygame.event.post(pygame.event.Event(pygame.QUIT))
 
-        # ── Hardware button ──────────────────────────────────────────────
+        # ── Hardware buttons ──────────────────────────────────────────────
         if button.consume() and busy_name is None:
             threading.Thread(target=do_manual_capture, daemon=True).start()
+            
+        if tare_button.consume() and busy_name is None:
+            threading.Thread(target=do_tare, daemon=True).start()
 
         # ── Config hot-reload ───────────────────────────────────────────
         try:
@@ -875,12 +822,12 @@ def main():
 
         # ── Weights ─────────────────────────────────────────────────────
         vals   = scale.get_values()
-        mean_g = vals["ema_mean_g"]
+        mean_g = vals["disp_mean_g"]
         now    = time.time()
 
         update_shared(autocapture_enabled=autocapture, uart_ok=vals.get("uart_ok", False))
 
-        # ── State machine (only auto-triggers when autocapture is ON) ────
+        # ── State machine ────────────────────────────────────────────────
         if state == "idle":
             if autocapture and mean_g >= trigger_g:
                 state         = "countdown"
